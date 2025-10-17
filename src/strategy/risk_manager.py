@@ -1,0 +1,452 @@
+"""
+Risk Management System for HFT Trading
+=====================================
+
+Comprehensive risk management with real-time monitoring and controls.
+"""
+
+import time
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum
+import threading
+import numpy as np
+from loguru import logger
+
+from ..utils.config import config
+from .avellaneda_stoikov import MarketQuote
+
+
+class RiskLevel(Enum):
+    """Risk level enumeration"""
+    LOW = "low"
+    MEDIUM = "medium" 
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+@dataclass
+class RiskMetrics:
+    """Current risk metrics snapshot"""
+    timestamp: float
+    position: float
+    unrealized_pnl: float
+    realized_pnl: float
+    daily_pnl: float
+    max_drawdown: float
+    var_95: float  # 95% Value at Risk
+    leverage: float
+    position_utilization: float  # Position / Max Position
+    risk_level: RiskLevel
+    
+    
+@dataclass
+class RiskLimits:
+    """Risk limit configuration"""
+    max_position: float = 10.0
+    max_daily_loss: float = 1000.0
+    max_drawdown: float = 0.05  # 5%
+    max_leverage: float = 3.0
+    max_var_95: float = 500.0
+    latency_threshold_ms: float = 100.0
+    min_quote_confidence: float = 0.5
+    
+
+class RiskManager:
+    """
+    Professional risk management system with real-time monitoring:
+    
+    Features:
+    - Position and leverage limits
+    - PnL tracking and drawdown control
+    - Latency monitoring
+    - Quote quality assessment
+    - Emergency stop mechanisms
+    - Risk reporting and alerts
+    """
+    
+    def __init__(self, limits: RiskLimits = None):
+        self.limits = limits or RiskLimits()
+        
+        # Position and PnL tracking
+        self.current_position = 0.0
+        self.avg_entry_price = 0.0
+        self.realized_pnl = 0.0
+        self.daily_pnl = 0.0
+        self.peak_equity = 0.0
+        self.current_drawdown = 0.0
+        self.max_drawdown = 0.0
+        
+        # Performance tracking
+        self.pnl_history: List[Tuple[float, float]] = []  # (timestamp, pnl)
+        self.trade_history: List[Dict] = []
+        self.latency_samples: List[float] = []
+        
+        # Risk state
+        self.is_trading_enabled = True
+        self.current_risk_level = RiskLevel.LOW
+        self.risk_alerts: List[str] = []
+        
+        # Threading for real-time monitoring
+        self._lock = threading.RLock()
+        self._monitoring_active = True
+        
+        # Statistics
+        self.stats = {
+            'risk_checks': 0,
+            'risk_violations': 0,
+            'emergency_stops': 0,
+            'quotes_blocked': 0
+        }
+        
+        logger.info(f"RiskManager initialized with limits: {self.limits}")
+    
+    def update_position(self, 
+                       position: float, 
+                       avg_price: float, 
+                       timestamp: float = None) -> None:
+        """Update current position and average entry price"""
+        with self._lock:
+            if timestamp is None:
+                timestamp = time.time()
+            
+            # Calculate realized PnL if position changed
+            if position != self.current_position:
+                if self.current_position != 0:
+                    # Partial or full close
+                    position_change = position - self.current_position
+                    if (self.current_position > 0 and position_change < 0) or \
+                       (self.current_position < 0 and position_change > 0):
+                        # Closing position
+                        closed_quantity = min(abs(position_change), abs(self.current_position))
+                        if self.current_position > 0:
+                            pnl_per_unit = avg_price - self.avg_entry_price
+                        else:
+                            pnl_per_unit = self.avg_entry_price - avg_price
+                        
+                        trade_pnl = closed_quantity * pnl_per_unit
+                        self.realized_pnl += trade_pnl
+                        self.daily_pnl += trade_pnl
+                        
+                        # Log trade
+                        self.trade_history.append({
+                            'timestamp': timestamp,
+                            'side': 'sell' if position_change < 0 else 'buy',
+                            'quantity': closed_quantity,
+                            'price': avg_price,
+                            'pnl': trade_pnl
+                        })
+            
+            self.current_position = position
+            self.avg_entry_price = avg_price
+            
+            logger.debug(f"Position updated: {position:.4f} @ {avg_price:.2f}")
+    
+    def calculate_unrealized_pnl(self, current_price: float) -> float:
+        """Calculate current unrealized PnL"""
+        if self.current_position == 0:
+            return 0.0
+        
+        if self.current_position > 0:
+            return self.current_position * (current_price - self.avg_entry_price)
+        else:
+            return abs(self.current_position) * (self.avg_entry_price - current_price)
+    
+    def update_pnl(self, current_price: float, timestamp: float = None) -> None:
+        """Update PnL calculations and drawdown tracking"""
+        with self._lock:
+            if timestamp is None:
+                timestamp = time.time()
+            
+            unrealized_pnl = self.calculate_unrealized_pnl(current_price)
+            total_pnl = self.realized_pnl + unrealized_pnl
+            
+            # Update peak and drawdown
+            if total_pnl > self.peak_equity:
+                self.peak_equity = total_pnl
+                self.current_drawdown = 0.0
+            else:
+                self.current_drawdown = (self.peak_equity - total_pnl) / max(abs(self.peak_equity), 1.0)
+                self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
+            
+            # Store PnL history
+            self.pnl_history.append((timestamp, total_pnl))
+            
+            # Keep only recent history (last 24 hours)
+            cutoff_time = timestamp - 86400  # 24 hours
+            self.pnl_history = [(t, pnl) for t, pnl in self.pnl_history if t >= cutoff_time]
+    
+    def record_latency(self, latency_ms: float) -> None:
+        """Record latency measurement"""
+        with self._lock:
+            self.latency_samples.append(latency_ms)
+            
+            # Keep only recent samples (last 1000)
+            if len(self.latency_samples) > 1000:
+                self.latency_samples = self.latency_samples[-1000:]
+    
+    def check_quote_risk(self, quote: MarketQuote, current_price: float) -> bool:
+        """
+        Check if a quote is acceptable from risk perspective.
+        Returns True if quote should be allowed, False to block.
+        """
+        with self._lock:
+            self.stats['risk_checks'] += 1
+            
+            # Check if trading is enabled
+            if not self.is_trading_enabled:
+                self.stats['quotes_blocked'] += 1
+                return False
+            
+            # Check quote confidence
+            if quote.confidence < self.limits.min_quote_confidence:
+                logger.warning(f"Quote blocked due to low confidence: {quote.confidence:.2f}")
+                self.stats['quotes_blocked'] += 1
+                return False
+            
+            # Check position limits
+            max_bid_size = self.limits.max_position - self.current_position
+            max_ask_size = self.limits.max_position + self.current_position
+            
+            if quote.bid_size > max_bid_size and max_bid_size > 0:
+                logger.warning(f"Bid size {quote.bid_size:.4f} exceeds position limit")
+                return False
+            
+            if quote.ask_size > max_ask_size and max_ask_size > 0:
+                logger.warning(f"Ask size {quote.ask_size:.4f} exceeds position limit") 
+                return False
+            
+            # Check drawdown limits
+            if self.current_drawdown > self.limits.max_drawdown:
+                logger.error(f"Drawdown limit exceeded: {self.current_drawdown:.3f} > {self.limits.max_drawdown:.3f}")
+                self._trigger_emergency_stop("Drawdown limit exceeded")
+                return False
+            
+            # Check daily loss limits
+            if self.daily_pnl < -self.limits.max_daily_loss:
+                logger.error(f"Daily loss limit exceeded: {self.daily_pnl:.2f} < -{self.limits.max_daily_loss:.2f}")
+                self._trigger_emergency_stop("Daily loss limit exceeded")
+                return False
+            
+            return True
+    
+    def assess_risk_level(self, current_price: float) -> RiskLevel:
+        """Assess current risk level based on multiple factors"""
+        with self._lock:
+            risk_score = 0.0
+            
+            # Position utilization risk
+            position_util = abs(self.current_position) / self.limits.max_position
+            risk_score += position_util * 30
+            
+            # Drawdown risk
+            risk_score += self.current_drawdown / self.limits.max_drawdown * 40
+            
+            # Daily PnL risk
+            if self.daily_pnl < 0:
+                pnl_risk = abs(self.daily_pnl) / self.limits.max_daily_loss
+                risk_score += pnl_risk * 30
+            
+            # Latency risk
+            if self.latency_samples:
+                avg_latency = sum(self.latency_samples[-10:]) / min(len(self.latency_samples), 10)
+                if avg_latency > self.limits.latency_threshold_ms:
+                    risk_score += (avg_latency / self.limits.latency_threshold_ms - 1) * 20
+            
+            # Determine risk level
+            if risk_score < 25:
+                return RiskLevel.LOW
+            elif risk_score < 50:
+                return RiskLevel.MEDIUM
+            elif risk_score < 75:
+                return RiskLevel.HIGH
+            else:
+                return RiskLevel.CRITICAL
+    
+    def _trigger_emergency_stop(self, reason: str) -> None:
+        """Trigger emergency stop mechanism"""
+        with self._lock:
+            self.is_trading_enabled = False
+            self.current_risk_level = RiskLevel.CRITICAL
+            self.risk_alerts.append(f"{time.time()}: EMERGENCY STOP - {reason}")
+            self.stats['emergency_stops'] += 1
+            
+            logger.critical(f"EMERGENCY STOP TRIGGERED: {reason}")
+    
+    def enable_trading(self, force: bool = False) -> bool:
+        """
+        Enable trading after risk checks.
+        Returns True if trading enabled successfully.
+        """
+        with self._lock:
+            if not force:
+                # Check if conditions allow re-enabling
+                if self.current_drawdown > self.limits.max_drawdown * 0.8:
+                    logger.warning("Cannot enable trading: drawdown too high")
+                    return False
+                
+                if self.daily_pnl < -self.limits.max_daily_loss * 0.8:
+                    logger.warning("Cannot enable trading: daily loss too high")
+                    return False
+            
+            self.is_trading_enabled = True
+            self.risk_alerts.append(f"{time.time()}: Trading enabled")
+            logger.info("Trading enabled")
+            return True
+    
+    def disable_trading(self, reason: str = "Manual disable") -> None:
+        """Disable trading manually"""
+        with self._lock:
+            self.is_trading_enabled = False
+            self.risk_alerts.append(f"{time.time()}: Trading disabled - {reason}")
+            logger.warning(f"Trading disabled: {reason}")
+    
+    def get_risk_metrics(self, current_price: float) -> RiskMetrics:
+        """Get comprehensive risk metrics snapshot"""
+        with self._lock:
+            unrealized_pnl = self.calculate_unrealized_pnl(current_price)
+            
+            # Calculate leverage (if applicable)
+            leverage = 1.0  # Spot trading
+            if hasattr(self, 'margin_used') and self.margin_used > 0:
+                leverage = abs(self.current_position * current_price) / self.margin_used
+            
+            # Calculate VaR (simplified using standard deviation)
+            var_95 = 0.0
+            if len(self.pnl_history) > 10:
+                recent_pnl = [pnl for _, pnl in self.pnl_history[-100:]]
+                pnl_std = np.std(recent_pnl) if len(recent_pnl) > 1 else 0
+                var_95 = 1.645 * pnl_std  # 95% confidence level
+            
+            position_util = abs(self.current_position) / self.limits.max_position
+            risk_level = self.assess_risk_level(current_price)
+            
+            return RiskMetrics(
+                timestamp=time.time(),
+                position=self.current_position,
+                unrealized_pnl=unrealized_pnl,
+                realized_pnl=self.realized_pnl,
+                daily_pnl=self.daily_pnl,
+                max_drawdown=self.max_drawdown,
+                var_95=var_95,
+                leverage=leverage,
+                position_utilization=position_util,
+                risk_level=risk_level
+            )
+    
+    def get_statistics(self) -> Dict:
+        """Get risk management statistics"""
+        with self._lock:
+            # Calculate latency statistics
+            latency_stats = {}
+            if self.latency_samples:
+                latency_stats = {
+                    'avg_latency_ms': sum(self.latency_samples) / len(self.latency_samples),
+                    'p95_latency_ms': np.percentile(self.latency_samples, 95),
+                    'p99_latency_ms': np.percentile(self.latency_samples, 99),
+                    'max_latency_ms': max(self.latency_samples)
+                }
+            
+            return {
+                **self.stats,
+                'is_trading_enabled': self.is_trading_enabled,
+                'current_risk_level': self.current_risk_level.value,
+                'current_position': self.current_position,
+                'realized_pnl': self.realized_pnl,
+                'daily_pnl': self.daily_pnl,
+                'current_drawdown': self.current_drawdown,
+                'max_drawdown': self.max_drawdown,
+                'trade_count': len(self.trade_history),
+                'alert_count': len(self.risk_alerts),
+                **latency_stats
+            }
+    
+    def reset_daily(self) -> None:
+        """Reset daily statistics (call at start of each trading day)"""
+        with self._lock:
+            self.daily_pnl = 0.0
+            self.trade_history.clear()
+            
+            # Keep only recent risk alerts
+            current_time = time.time()
+            self.risk_alerts = [
+                alert for alert in self.risk_alerts 
+                if float(alert.split(':')[0]) > current_time - 86400
+            ]
+            
+            logger.info("Daily risk statistics reset")
+    
+    def export_report(self) -> Dict:
+        """Export comprehensive risk report"""
+        with self._lock:
+            return {
+                'timestamp': time.time(),
+                'limits': {
+                    'max_position': self.limits.max_position,
+                    'max_daily_loss': self.limits.max_daily_loss,
+                    'max_drawdown': self.limits.max_drawdown,
+                    'max_leverage': self.limits.max_leverage
+                },
+                'current_state': {
+                    'position': self.current_position,
+                    'avg_entry_price': self.avg_entry_price,
+                    'realized_pnl': self.realized_pnl,
+                    'daily_pnl': self.daily_pnl,
+                    'max_drawdown': self.max_drawdown,
+                    'is_trading_enabled': self.is_trading_enabled
+                },
+                'statistics': self.get_statistics(),
+                'recent_trades': self.trade_history[-10:],
+                'recent_alerts': self.risk_alerts[-5:]
+            }
+
+
+# Example usage
+if __name__ == "__main__":
+    import numpy as np
+    
+    # Initialize risk manager
+    limits = RiskLimits(
+        max_position=5.0,
+        max_daily_loss=500.0,
+        max_drawdown=0.03
+    )
+    
+    risk_manager = RiskManager(limits)
+    
+    # Simulate some trading activity
+    current_price = 50000.0
+    
+    # Update position
+    risk_manager.update_position(2.5, 49950.0)
+    risk_manager.update_pnl(current_price)
+    
+    # Record some latency samples
+    for _ in range(10):
+        risk_manager.record_latency(np.random.normal(50, 10))
+    
+    # Get risk metrics
+    metrics = risk_manager.get_risk_metrics(current_price)
+    print(f"Risk Level: {metrics.risk_level.value}")
+    print(f"Position Utilization: {metrics.position_utilization:.2f}")
+    print(f"Unrealized PnL: {metrics.unrealized_pnl:.2f}")
+    
+    # Test quote risk check
+    from .avellaneda_stoikov import MarketQuote
+    
+    test_quote = MarketQuote(
+        bid_price=49995.0,
+        ask_price=50005.0,
+        bid_size=1.0,
+        ask_size=1.0,
+        reservation_price=50000.0,
+        half_spread=5.0,
+        timestamp=time.time(),
+        confidence=0.8
+    )
+    
+    allowed = risk_manager.check_quote_risk(test_quote, current_price)
+    print(f"Quote allowed: {allowed}")
+    
+    # Print statistics
+    print(f"Statistics: {risk_manager.get_statistics()}")

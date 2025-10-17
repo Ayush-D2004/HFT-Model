@@ -1,0 +1,28 @@
+# Python bytecode and cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment (this project uses 'hft' folder)
+hft/
+
+# Environment variables and secrets
+.env
+api_keys.json
+
+# IDE settings (keep private)
+.vscode/
+.copilot-instructions
+
+# Trading data and results
+data/
+backtest_results/
+*.csv
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

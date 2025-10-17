@@ -1,0 +1,31 @@
+# Core dependencies (Python 3.13 compatible)
+numpy>=1.26.0
+pandas>=2.1.0
+websockets>=12.0
+requests>=2.31.0
+python-binance>=1.0.19
+
+# Data processing
+scipy>=1.11.4
+# numba>=0.58.0  # Temporarily commented due to Python 3.13 compatibility
+
+# Visualization and Dashboard
+streamlit>=1.28.0
+plotly>=5.17.0
+seaborn>=0.13.0
+matplotlib>=3.8.0
+
+# Configuration and utilities
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+loguru>=0.7.0
+typer>=0.9.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.1
+
+# Development
+black>=23.7.0
+flake8>=6.0.0
+mypy>=1.5.1
