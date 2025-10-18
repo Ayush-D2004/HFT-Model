@@ -10,13 +10,15 @@ import time
 import json
 from typing import Dict, List, Optional, Iterator, Callable, Any
 from dataclasses import dataclass
+from datetime import timezone
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from loguru import logger
 
-from ..data_ingestion.order_book import OrderBook, OrderBookSnapshot
-from ..strategy import AvellanedaStoikovPricer, QuoteManager, RiskManager
+from src.data_ingestion.order_book import OrderBook, OrderBookSnapshot
+from src.data_ingestion.binance_historical import BinanceHistoricalDataFetcher
+from src.strategy import AvellanedaStoikovPricer, QuoteManager, RiskManager
 
 
 @dataclass
@@ -39,44 +41,60 @@ class BacktestEvent:
 
 class HistoricalDataLoader:
     """
-    Loads and preprocesses historical market data for replay.
-    Supports multiple data formats and ensures chronological ordering.
+    Loads and preprocesses REAL historical market data from Binance API for replay.
+    No synthetic data - only real market data from Binance.
     """
     
     def __init__(self, data_directory: str):
         self.data_directory = Path(data_directory)
+        # Initialize Binance historical data fetcher
+        from src.data_ingestion.binance_historical import BinanceHistoricalDataFetcher
+        self.binance_fetcher = BinanceHistoricalDataFetcher(use_testnet=False)
         
     def load_binance_depth_data(self, 
                                symbol: str, 
                                start_date: str, 
                                end_date: str) -> Iterator[TickData]:
         """
-        Load Binance depth data from files.
-        Expected format: JSON lines with depth updates.
+        Load REAL Binance market data from Binance API.
+        Fetches actual historical kline data and generates realistic order book snapshots.
         """
         try:
-            # Generate file paths for date range
-            start_dt = pd.to_datetime(start_date)
-            end_dt = pd.to_datetime(end_date)
+            logger.info(f"Fetching REAL market data from Binance API for {symbol}")
             
-            current_date = start_dt
-            while current_date <= end_dt:
-                date_str = current_date.strftime('%Y%m%d')
-                
-                # Check for depth data file
-                depth_file = self.data_directory / f"{symbol.lower()}_{date_str}_depth.json"
-                if depth_file.exists():
-                    yield from self._load_json_file(depth_file, 'depth')
-                
-                # Check for trade data file
-                trade_file = self.data_directory / f"{symbol.lower()}_{date_str}_trades.json"
-                if trade_file.exists():
-                    yield from self._load_json_file(trade_file, 'trade')
-                
-                current_date += pd.Timedelta(days=1)
+            # Convert to datetime objects
+            start_dt = pd.to_datetime(start_date).replace(tzinfo=timezone.utc) 
+            end_dt = pd.to_datetime(end_date).replace(tzinfo=timezone.utc)
+            
+            # Fetch real kline data from Binance
+            kline_data = self.binance_fetcher.get_kline_data(symbol, start_dt, end_dt, '1m')
+            
+            if kline_data.empty:
+                logger.error(f"No real market data available from Binance for {symbol} in specified period")
+                return
+            
+            logger.success(f"Retrieved {len(kline_data)} minutes of real market data from Binance")
+            
+            # Generate realistic order book snapshots from real kline data
+            order_book_updates = self.binance_fetcher.simulate_order_book_from_klines(kline_data)
+            
+            # Convert to TickData objects and yield
+            for update in order_book_updates:
+                tick_data = TickData(
+                    timestamp=update['timestamp'],
+                    event_type='depth_snapshot',
+                    symbol=symbol,
+                    data={
+                        'bids': update['bids'],
+                        'asks': update['asks'],
+                        'lastUpdateId': update['lastUpdateId'],
+                        'source': 'BINANCE_REAL_HISTORICAL'
+                    }
+                )
+                yield tick_data
                 
         except Exception as e:
-            logger.error(f"Error loading historical data: {e}")
+            logger.error(f"Error fetching real historical data from Binance: {e}")
     
     def _load_json_file(self, file_path: Path, data_type: str) -> Iterator[TickData]:
         """Load JSON lines file and convert to TickData objects"""
@@ -109,99 +127,7 @@ class HistoricalDataLoader:
                         
         except Exception as e:
             logger.error(f"Error reading file {file_path}: {e}")
-    
-    def generate_synthetic_data(self, 
-                              symbol: str,
-                              duration_hours: int = 24,
-                              tick_frequency_ms: int = 100) -> Iterator[TickData]:
-        """
-        Generate synthetic market data for testing.
-        Creates realistic order book movements and trade activity.
-        """
-        try:
-            base_price = 50000.0
-            current_time = time.time()
-            end_time = current_time + (duration_hours * 3600)
-            
-            # Initialize order book state
-            bids = {base_price - i: np.random.exponential(2.0) for i in range(1, 21)}
-            asks = {base_price + i: np.random.exponential(2.0) for i in range(1, 21)}
-            update_id = 1000
-            
-            # Send initial snapshot
-            yield TickData(
-                timestamp=current_time,
-                event_type='snapshot',
-                symbol=symbol,
-                data={
-                    'lastUpdateId': update_id,
-                    'bids': [[str(p), str(q)] for p, q in sorted(bids.items(), reverse=True)],
-                    'asks': [[str(p), str(q)] for p, q in sorted(asks.items())]
-                }
-            )
-            
-            while current_time < end_time:
-                current_time += tick_frequency_ms / 1000.0
-                update_id += 1
-                
-                # Generate market movement
-                price_change = np.random.normal(0, 0.1)
-                
-                # Update order book levels
-                updates_b = []
-                updates_a = []
-                
-                # Random bid updates
-                if np.random.random() < 0.3:
-                    price = np.random.choice(list(bids.keys()))
-                    new_qty = max(0, bids[price] + np.random.normal(0, 0.5))
-                    bids[price] = new_qty
-                    updates_b.append([str(price), str(new_qty)])
-                
-                # Random ask updates
-                if np.random.random() < 0.3:
-                    price = np.random.choice(list(asks.keys()))
-                    new_qty = max(0, asks[price] + np.random.normal(0, 0.5))
-                    asks[price] = new_qty
-                    updates_a.append([str(price), str(new_qty)])
-                
-                # Yield update if there are changes
-                if updates_b or updates_a:
-                    yield TickData(
-                        timestamp=current_time,
-                        event_type='update',
-                        symbol=symbol,
-                        data={
-                            'U': update_id,
-                            'u': update_id,
-                            'b': updates_b,
-                            'a': updates_a
-                        }
-                    )
-                
-                # Generate trades occasionally
-                if np.random.random() < 0.1:
-                    best_bid = max(bids.keys())
-                    best_ask = min(asks.keys())
-                    trade_price = best_bid if np.random.random() < 0.5 else best_ask
-                    trade_qty = np.random.exponential(1.0)
-                    
-                    yield TickData(
-                        timestamp=current_time,
-                        event_type='trade',
-                        symbol=symbol,
-                        data={
-                            's': symbol,
-                            'p': str(trade_price),
-                            'q': str(trade_qty),
-                            'T': int(current_time * 1000),
-                            't': update_id,
-                            'm': np.random.random() < 0.5
-                        }
-                    )
-                    
-        except Exception as e:
-            logger.error(f"Error generating synthetic data: {e}")
+
 
 
 class OrderBookReplayEngine:
@@ -225,8 +151,8 @@ class OrderBookReplayEngine:
         self.data_loader = data_loader
         self.strategy_callback = strategy_callback
         
-        # Order book for replay
-        self.order_book = OrderBook(symbol, max_levels=50)
+        # Order book for replay - use non-strict sequencing for backtesting
+        self.order_book = OrderBook(symbol, max_levels=50, strict_sequencing=False)
         
         # Replay state
         self.current_time = 0.0
@@ -275,8 +201,8 @@ class OrderBookReplayEngine:
             self.events_total = len(all_ticks)
             
             if self.events_total == 0:
-                logger.warning("No tick data found for specified date range")
-                return self._generate_results()
+                logger.error("No real market data found for the specified period - please check date range and symbol")
+                raise ValueError("Cannot proceed without real market data from Binance")
             
             logger.info(f"Loaded {self.events_total} tick events")
             
@@ -286,8 +212,9 @@ class OrderBookReplayEngine:
                 if success:
                     self.events_processed += 1
                 
-                # Update progress periodically
-                if self.events_processed % 10000 == 0:
+                # Update progress periodically (adjust frequency based on total events)
+                progress_interval = max(100, self.events_total // 10)  # Show progress 10 times or every 100 events
+                if self.events_processed % progress_interval == 0:
                     progress = (self.events_processed / self.events_total) * 100
                     logger.info(f"Backtest progress: {progress:.1f}%")
             
@@ -303,36 +230,7 @@ class OrderBookReplayEngine:
             logger.error(f"Error during backtest: {e}")
             return {'success': False, 'error': str(e)}
     
-    def run_synthetic_backtest(self, 
-                             duration_hours: int = 1,
-                             tick_frequency_ms: int = 100) -> Dict[str, Any]:
-        """Run backtest with synthetic data for testing"""
-        try:
-            self.start_time = time.time()
-            
-            logger.info(f"Starting synthetic backtest: {duration_hours}h duration")
-            
-            # Generate synthetic data
-            synthetic_data = self.data_loader.generate_synthetic_data(
-                self.symbol, duration_hours, tick_frequency_ms
-            )
-            
-            # Process synthetic ticks
-            for tick in synthetic_data:
-                success = self._process_tick(tick)
-                if success:
-                    self.events_processed += 1
-            
-            self.end_time = time.time()
-            self.stats['replay_duration_sec'] = self.end_time - self.start_time
-            
-            logger.success(f"Synthetic backtest completed: {self.events_processed} events processed")
-            
-            return self._generate_results()
-            
-        except Exception as e:
-            logger.error(f"Error during synthetic backtest: {e}")
-            return {'success': False, 'error': str(e)}
+
     
     def _process_tick(self, tick: TickData) -> bool:
         """Process individual tick data event"""
@@ -340,7 +238,7 @@ class OrderBookReplayEngine:
             self.current_time = tick.timestamp
             
             # Route to appropriate handler
-            if tick.event_type == 'snapshot':
+            if tick.event_type in ['snapshot', 'depth_snapshot']:
                 return self._handle_snapshot(tick)
             elif tick.event_type == 'update':
                 return self._handle_update(tick)
@@ -544,12 +442,15 @@ if __name__ == "__main__":
         mock_strategy_callback
     )
     
-    # Run synthetic backtest
-    results = replay_engine.run_synthetic_backtest(duration_hours=0.1)  # 6 minutes
+    # Run real market data backtest
+    results = replay_engine.run("2024-01-01", "2024-01-02")  # 1 day of real data
     
-    print("Backtest Results:")
+    print("Real Market Data Backtest Results:")
     print(f"Success: {results['success']}")
-    print(f"Events processed: {results['metadata']['events_processed']}")
-    print(f"Processing rate: {results['performance']['processing_rate_eps']:.1f} events/sec")
-    print(f"Order book health: {results['performance']['orderbook_health']}")
-    print(f"Statistics: {results['statistics']}")
+    if results['success']:
+        print(f"Events processed: {results['metadata']['events_processed']}")
+        print(f"Processing rate: {results['performance']['processing_rate_eps']:.1f} events/sec")
+        print(f"Order book health: {results['performance']['orderbook_health']}")
+        print(f"Statistics: {results['statistics']}")
+    else:
+        print(f"Error: {results.get('error', 'Unknown error')}")

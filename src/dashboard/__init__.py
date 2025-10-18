@@ -9,6 +9,6 @@ Real-time Streamlit dashboard with comprehensive analytics:
 - Backtesting interface and results
 """
 
-from .app import main
+from ...app import main
 
 __all__ = ['main']

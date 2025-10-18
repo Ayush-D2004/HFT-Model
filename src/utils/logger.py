@@ -79,10 +79,11 @@ class LogConfig:
         )
         
         self.current_level = level
-        self._initialized = True
         
-        if level != LogLevel.SILENT:
+        if level != LogLevel.SILENT and not self._initialized:
             logger.info(f"Logging configured: level={level.value}")
+        
+        self._initialized = True
     
     def set_backtesting_mode(self) -> None:
         """Configure logging for backtesting - minimal output"""

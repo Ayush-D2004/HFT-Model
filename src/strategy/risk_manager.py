@@ -45,7 +45,7 @@ class RiskLimits:
     """Risk limit configuration"""
     max_position: float = 10.0
     max_daily_loss: float = 1000.0
-    max_drawdown: float = 0.05  # 5%
+    max_drawdown: float = 0.30  # 30% - more realistic for market making
     max_leverage: float = 3.0
     max_var_95: float = 500.0
     latency_threshold_ms: float = 100.0
@@ -65,8 +65,9 @@ class RiskManager:
     - Risk reporting and alerts
     """
     
-    def __init__(self, limits: RiskLimits = None):
+    def __init__(self, limits: RiskLimits = None, initial_capital: float = 10000.0):
         self.limits = limits or RiskLimits()
+        self.initial_capital = initial_capital
         
         # Position and PnL tracking
         self.current_position = 0.0
@@ -166,7 +167,10 @@ class RiskManager:
                 self.peak_equity = total_pnl
                 self.current_drawdown = 0.0
             else:
-                self.current_drawdown = (self.peak_equity - total_pnl) / max(abs(self.peak_equity), 1.0)
+                # Calculate drawdown as percentage of (initial_capital + peak_equity)
+                # This prevents artificially high drawdowns when starting from 0 P&L
+                equity_base = self.initial_capital + max(self.peak_equity, 0.0)
+                self.current_drawdown = (self.peak_equity - total_pnl) / equity_base
                 self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
             
             # Store PnL history

@@ -35,7 +35,7 @@ class TradingConfig(BaseModel):
 class RiskConfig(BaseModel):
     """Risk management configuration"""
     max_loss: float = Field(default=1000.0, description="Maximum daily loss")
-    max_drawdown: float = Field(default=0.05, description="Maximum drawdown (5%)")
+    max_drawdown: float = Field(default=0.30, description="Maximum drawdown (30%) - realistic for market making")
     position_limit: float = Field(default=10.0, description="Position limit")
     latency_threshold_ms: float = Field(default=100.0, description="Latency threshold in ms")
 

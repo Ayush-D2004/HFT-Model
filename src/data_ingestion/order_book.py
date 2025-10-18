@@ -67,9 +67,10 @@ class OrderBook:
     - Low latency updates with minimal memory allocation
     """
     
-    def __init__(self, symbol: str, max_levels: int = 20):
+    def __init__(self, symbol: str, max_levels: int = 20, strict_sequencing: bool = True):
         self.symbol = symbol
         self.max_levels = max_levels
+        self.strict_sequencing = strict_sequencing  # Control sequence validation strictness
         
         # Order book state
         self.bids: Dict[float, float] = {}  # price -> quantity
@@ -201,10 +202,14 @@ class OrderBook:
         
         # Check for gap (missing updates)
         if first_id > expected_next:
-            logger.warning(f"Sequence gap detected: expected {expected_next}, got {first_id}")
-            self.stats['out_of_sequence'] += 1
-            # We could request a new snapshot here
-            return False
+            if self.strict_sequencing:
+                logger.warning(f"Sequence gap detected: expected {expected_next}, got {first_id}")
+                self.stats['out_of_sequence'] += 1
+                return False
+            else:
+                # In non-strict mode (backtesting), silently accept gaps
+                self.stats['out_of_sequence'] += 1
+                return True  # Allow the update to continue
         
         # Check for duplicate/old update
         if final_id <= self.last_update_id:

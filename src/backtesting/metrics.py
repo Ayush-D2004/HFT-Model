@@ -17,7 +17,7 @@ from scipy import stats
 from loguru import logger
 
 from .fill_simulator import FillEvent
-from ..strategy import Order, OrderSide
+from src.strategy import Order, OrderSide
 
 
 @dataclass
@@ -29,6 +29,7 @@ class PerformanceMetrics:
     unrealized_pnl: float
     gross_pnl: float
     net_pnl: float
+    total_return_pct: float  # Total return as percentage
     
     # Returns and Risk
     sharpe_ratio: float
@@ -45,6 +46,7 @@ class PerformanceMetrics:
     win_rate: float
     avg_win: float
     avg_loss: float
+    avg_trade_pnl: float  # Average PnL per trade
     profit_factor: float
     
     # Market Making Metrics
@@ -58,11 +60,16 @@ class PerformanceMetrics:
     avg_fill_latency_ms: float
     total_fees: float
     fee_rate: float
+    total_volume: float  # Total traded volume in USDT
     
     # Time-based Metrics
     start_time: float
     end_time: float
     duration_hours: float
+    
+    # Chart Data - for dashboard visualization
+    pnl_history: List[float] = None  # Cumulative P&L over time
+    timestamps: List[float] = None   # Timestamps for P&L history
     
     
 class BacktestMetrics:
@@ -334,13 +341,14 @@ class BacktestMetrics:
                 
                 avg_win = np.mean(winning_pnls) if winning_pnls else 0.0
                 avg_loss = np.mean(losing_pnls) if losing_pnls else 0.0
+                avg_trade_pnl = np.mean(trade_pnls)  # Average PnL per trade
                 
                 gross_profit = sum(winning_pnls) if winning_pnls else 0.0
                 gross_loss = abs(sum(losing_pnls)) if losing_pnls else 0.0
                 profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf') if gross_profit > 0 else 0.0
             else:
                 winning_trades = losing_trades = 0
-                win_rate = avg_win = avg_loss = profit_factor = 0.0
+                win_rate = avg_win = avg_loss = avg_trade_pnl = profit_factor = 0.0
             
             # Fill and execution metrics
             total_fills = len(self.fill_events)
@@ -367,8 +375,16 @@ class BacktestMetrics:
             
             adverse_selection_rate = adverse_fills / max(total_fills, 1)
             
-            # Fee metrics
-            fee_rate = self.total_fees / max(sum(fill.fill_quantity * fill.fill_price for fill in self.fill_events), 1)
+            # Volume and fee metrics
+            total_volume = sum(fill.fill_quantity * fill.fill_price for fill in self.fill_events)
+            fee_rate = self.total_fees / max(total_volume, 1)
+            
+            # Calculate total return percentage
+            total_return_pct = (total_pnl / self.initial_capital) * 100 if self.initial_capital > 0 else 0.0
+            
+            # Prepare chart data for dashboard
+            pnl_history = [pnl for _, pnl in self.pnl_series] if self.pnl_series else []
+            timestamps = [ts for ts, _ in self.pnl_series] if self.pnl_series else []
             
             # Create metrics object
             metrics = PerformanceMetrics(
@@ -377,6 +393,7 @@ class BacktestMetrics:
                 unrealized_pnl=unrealized_pnl,
                 gross_pnl=gross_pnl,
                 net_pnl=net_pnl,
+                total_return_pct=total_return_pct,
                 
                 sharpe_ratio=sharpe_ratio,
                 sortino_ratio=sortino_ratio,
@@ -391,6 +408,7 @@ class BacktestMetrics:
                 win_rate=win_rate,
                 avg_win=avg_win,
                 avg_loss=avg_loss,
+                avg_trade_pnl=avg_trade_pnl,
                 profit_factor=profit_factor,
                 
                 fill_rate=fill_rate,
@@ -402,10 +420,15 @@ class BacktestMetrics:
                 avg_fill_latency_ms=avg_fill_latency,
                 total_fees=self.total_fees,
                 fee_rate=fee_rate,
+                total_volume=total_volume,
                 
                 start_time=start_time,
                 end_time=end_time,
-                duration_hours=duration_hours
+                duration_hours=duration_hours,
+                
+                # Chart data for dashboard
+                pnl_history=pnl_history,
+                timestamps=timestamps
             )
             
             # Cache the result
@@ -419,12 +442,14 @@ class BacktestMetrics:
             # Return default metrics on error
             return PerformanceMetrics(
                 total_pnl=0, realized_pnl=0, unrealized_pnl=0, gross_pnl=0, net_pnl=0,
+                total_return_pct=0.0,
                 sharpe_ratio=0, sortino_ratio=0, calmar_ratio=0, max_drawdown=0,
                 max_drawdown_duration=0, volatility=0, total_trades=0, winning_trades=0,
-                losing_trades=0, win_rate=0, avg_win=0, avg_loss=0, profit_factor=0,
+                losing_trades=0, win_rate=0, avg_win=0, avg_loss=0, avg_trade_pnl=0, profit_factor=0,
                 fill_rate=0, quote_hit_rate=0, avg_spread_captured=0, inventory_turnover=0,
-                adverse_selection_rate=0, avg_fill_latency_ms=0, total_fees=0, fee_rate=0,
-                start_time=current_time, end_time=current_time, duration_hours=0
+                adverse_selection_rate=0, avg_fill_latency_ms=0, total_fees=0, fee_rate=0, total_volume=0,
+                start_time=current_time, end_time=current_time, duration_hours=0,
+                pnl_history=[], timestamps=[]
             )
     
     def get_pnl_series(self) -> List[Tuple[float, float]]:
@@ -530,7 +555,7 @@ if __name__ == "__main__":
     
     # Simulate some trading activity
     from .fill_simulator import FillEvent, FillReason
-    from ..strategy import OrderSide
+    from src.strategy import OrderSide
     
     current_price = 50000.0
     

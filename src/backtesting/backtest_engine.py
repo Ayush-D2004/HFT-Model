@@ -21,17 +21,17 @@ from concurrent.futures import ThreadPoolExecutor
 import itertools
 from loguru import logger
 
-from ..utils.logger import setup_backtesting_logging, setup_development_logging
+from src.utils.logger import setup_backtesting_logging, setup_development_logging
 
 from .replay_engine import OrderBookReplayEngine, HistoricalDataLoader, BacktestEvent
 from .fill_simulator import FillSimulator, FillEvent
 from .metrics import BacktestMetrics, PerformanceMetrics
-from ..strategy import (
+from src.strategy import (
     AvellanedaStoikovPricer, QuoteManager, RiskManager, RiskLimits,
     QuoteParameters, Order, OrderSide
 )
-from ..data_ingestion import OrderBook
-from ..utils.config import config
+from src.data_ingestion import OrderBook
+from src.utils.config import config
 
 
 @dataclass
@@ -42,22 +42,22 @@ class BacktestConfig:
     end_date: str
     symbol: str = "BTCUSDT"
     
-    # Strategy parameters
-    gamma: float = 0.1
-    time_horizon: float = 30.0
-    min_spread: float = 0.02
+    # Strategy parameters - OPTIMIZED FOR HFT MARKET MAKING
+    gamma: float = 0.015  # Risk aversion - typical HFT range 0.01-0.02
+    time_horizon: float = 10.0  # Time horizon in seconds - HFT uses 5-15s
+    min_spread: float = 0.0005  # Minimum spread 0.05% (5 bps) - competitive HFT level
     tick_size: float = 0.01
     lot_size: float = 0.001
     
     # Risk parameters
     max_position: float = 10.0
-    max_daily_loss: float = 1000.0
-    max_drawdown: float = 0.05
+    max_daily_loss: float = 1000.0  
+    max_drawdown: float = 0.30  # 30% - realistic for market making
     
-    # Fill simulation
-    maker_fee: float = 0.001
-    taker_fee: float = 0.001
-    base_fill_probability: float = 0.8
+    # Fill simulation - BINANCE ACTUAL FEES
+    maker_fee: float = 0.0002  # 0.02% - Binance maker fee (limit orders)
+    taker_fee: float = 0.0005  # 0.05% - Binance taker fee (market orders)
+    # Note: base_fill_probability removed - now using realistic distance-based curve for 70-85% fill rate
     latency_mean_ms: float = 50.0
     
     # Execution
@@ -104,7 +104,7 @@ class StrategyBacktester:
             max_daily_loss=config.max_daily_loss,
             max_drawdown=config.max_drawdown
         )
-        self.risk_manager = RiskManager(risk_limits)
+        self.risk_manager = RiskManager(risk_limits, initial_capital=config.initial_capital)
         
         # Quote manager with backtesting order callback
         self.quote_manager = QuoteManager(
@@ -124,23 +124,36 @@ class StrategyBacktester:
         
         logger.info(f"StrategyBacktester initialized for {config.symbol}")
     
-    def _order_callback(self, order: Order) -> Dict[str, Any]:
-        """Handle order placement from quote manager"""
+    def _order_callback(self, order_data) -> Dict[str, Any]:
+        """Handle order placement/cancellation from quote manager"""
         try:
-            # Submit order to fill simulator
-            success = self.fill_simulator.submit_order(order)
+            # Handle cancellation requests (dict with 'action': 'cancel')
+            if isinstance(order_data, dict) and order_data.get('action') == 'cancel':
+                order_id = order_data['order_id']
+                success = self.fill_simulator.cancel_order(order_id)
+                
+                if success:
+                    return {'success': True}
+                else:
+                    return {'success': False, 'error': 'Order not found'}
             
-            if success:
-                return {
-                    'success': True,
-                    'order_id': order.order_id,
-                    'timestamp': order.timestamp
-                }
+            # Handle new order submission (Order object)
+            elif isinstance(order_data, Order):
+                success = self.fill_simulator.submit_order(order_data)
+                
+                if success:
+                    return {
+                        'success': True,
+                        'order_id': order_data.order_id,
+                        'timestamp': order_data.timestamp
+                    }
+                else:
+                    return {
+                        'success': False,
+                        'error': 'Fill simulator rejected order'
+                    }
             else:
-                return {
-                    'success': False,
-                    'error': 'Fill simulator rejected order'
-                }
+                return {'success': False, 'error': f'Invalid order_data type: {type(order_data)}'}
                 
         except Exception as e:
             logger.error(f"Error in order callback: {e}")
@@ -159,6 +172,8 @@ class StrategyBacktester:
             
             # Update metrics
             self.metrics.record_fill(fill_event, self.current_price)
+            # Record that our quote was hit
+            self.metrics.record_quote_update(fill_event.timestamp, was_hit=True)
             
             # Update pricer with inventory
             self.pricer.update_inventory(self.risk_manager.current_position)
@@ -201,6 +216,9 @@ class StrategyBacktester:
                 trade_rate=0.1,  # Could be calculated from recent trades
                 volatility=0.001  # Could be from pricer
             )
+            
+            # Update fill simulator with current position for inventory-based fills
+            self.fill_simulator.update_position(self.risk_manager.current_position)
             
             # Update strategy with new market data
             self.pricer.update_market(midprice, event.timestamp)
@@ -303,13 +321,12 @@ class BacktestEngine:
             if silent:
                 setup_backtesting_logging()
             
-            print(f"🔬 Running backtest: {config.symbol} {config.start_date} to {config.end_date}")
+            print(f"Running backtest: {config.symbol} {config.start_date} to {config.end_date}")
             
             # Initialize components
             fill_simulator = FillSimulator(
                 maker_fee=config.maker_fee,
                 taker_fee=config.taker_fee,
-                base_fill_probability=config.base_fill_probability,
                 latency_mean_ms=config.latency_mean_ms
             )
             
@@ -324,20 +341,12 @@ class BacktestEngine:
                 strategy_callback=strategy_backtester.handle_market_event
             )
             
-            # Run the backtest
-            if self._should_use_synthetic_data(config):
-                print("📊 Generating synthetic market data...")
-                replay_results = replay_engine.run_synthetic_backtest(
-                    duration_hours=24,  # 1 day of synthetic data
-                    tick_frequency_ms=100
-                )
-            else:
-                print("📈 Processing historical data...")
-                replay_results = replay_engine.run_backtest(
-                    start_date=config.start_date,
-                    end_date=config.end_date,
-                    replay_speed=config.replay_speed
-                )
+            # Run the backtest with REAL market data
+            print("Processing REAL historical data from Binance...")
+            replay_results = replay_engine.run_backtest(
+                start_date=config.start_date,
+                end_date=config.end_date
+            )
             
             if not replay_results.get('success', False):
                 return BacktestResult(
@@ -355,7 +364,7 @@ class BacktestEngine:
                     error=replay_results.get('error', 'Replay failed')
                 )
             
-            print("✅ Backtest completed, calculating metrics...")
+            print("Backtest completed, calculating metrics...")
             
             # Calculate final performance
             final_price = strategy_backtester.current_price or 50000.0
@@ -401,20 +410,7 @@ class BacktestEngine:
                 error=str(e)
             )
     
-    def _should_use_synthetic_data(self, config: BacktestConfig) -> bool:
-        """Determine if synthetic data should be used (e.g., if no historical data available)"""
-        # Check if historical data files exist for the date range
-        try:
-            start_dt = pd.to_datetime(config.start_date)
-            date_str = start_dt.strftime('%Y%m%d')
-            
-            symbol_lower = config.symbol.lower()
-            depth_file = self.data_directory / f"{symbol_lower}_{date_str}_depth.json"
-            
-            return not depth_file.exists()
-            
-        except Exception:
-            return True
+
     
     def run_parameter_sweep(self, 
                           base_config: BacktestConfig,
@@ -478,9 +474,9 @@ class BacktestEngine:
                             result = future.result()
                             results.append(result)
                             if result.success:
-                                print(f"✅ Completed backtest {i+1}/{len(configs)}: PnL=${result.performance.total_pnl:.2f}")
+                                print(f"Completed backtest {i+1}/{len(configs)}: PnL=${result.performance.total_pnl:.2f}")
                             else:
-                                print(f"❌ Backtest {i+1}/{len(configs)} failed")
+                                print(f"Backtest {i+1}/{len(configs)} failed")
                         except Exception as e:
                             print(f"💥 Backtest {i+1} failed: {e}")
             
