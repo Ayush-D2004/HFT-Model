@@ -20,10 +20,10 @@ from ..utils.config import config
 @dataclass
 class QuoteParameters:
     """Parameters for quote generation"""
-    gamma: float  # Risk aversion parameter
-    T: float      # Time horizon in seconds
-    k: Optional[float] = None  # Arrival rate (events/sec)
-    min_spread: float = 0.0   # Minimum spread constraint
+    gamma: float
+    T: float
+    k: Optional[float] = None
+    min_spread: float = 0.0
 
 
 @dataclass
@@ -36,7 +36,7 @@ class MarketQuote:
     reservation_price: float
     half_spread: float
     timestamp: float
-    confidence: float = 1.0  # Confidence in the quote (0-1)
+    confidence: float = 1.0
     
     @property
     def spread(self) -> float:
@@ -73,29 +73,23 @@ class AvellanedaStoikovPricer:
                  k_lookback_sec: int = 60,
                  max_inventory: float = 10.0):
         
-        # Market structure parameters
         self.tick_size = tick_size
         self.lot_size = lot_size
         self.max_inventory = max_inventory
         
-        # Market state tracking
         self.mid = None
         self.timestamp = None
         self.inventory = 0.0
         
-        # Volatility estimation (EWMA)
         self.ewma_alpha = ewma_alpha
         self.ewma_var = None
         self.vol_lookback_sec = vol_lookback_sec
-        self.price_history = deque(maxlen=1000)  # For fallback vol estimation
+        self.price_history = deque(maxlen=1000)
         
-        # Trade arrival rate estimation
         self.trade_timestamps = deque()
         self.k_lookback_sec = k_lookback_sec
-        # Initialize with reasonable default (0.1 events/sec) instead of near-zero
         self.last_k_estimate = 0.1
         
-        # Quote sizing parameters
         self.base_size = config.trading.lot_size
         self.size_adjustment_factor = 1.0
         
@@ -114,7 +108,9 @@ class AvellanedaStoikovPricer:
     def update_market(self, midprice: float, timestamp: float = None) -> None:
         """
         Update market state with new midprice observation.
-        Triggers volatility recalculation using EWMA.
+        Triggers volatility recalculation using EWMA with proper time-scaling.
+        
+        FIX #3: Normalize returns by time delta for consistent per-second volatility.
         """
         if timestamp is None:
             timestamp = time.time()
@@ -122,16 +118,22 @@ class AvellanedaStoikovPricer:
         midprice = float(midprice)
         timestamp = float(timestamp)
         
-        # Store price history
         self.price_history.append((midprice, timestamp))
         
-        # Calculate return if we have previous midprice
-        if self.mid is not None:
-            # Use log returns for better statistical properties
+        if self.mid is not None and self.timestamp is not None:
+            # Calculate log return
             log_return = math.log(midprice) - math.log(self.mid)
-            squared_return = log_return * log_return
             
-            # Update EWMA variance
+            # FIX #3: Normalize by time delta to get per-second volatility
+            # This ensures σ is consistent regardless of sampling rate
+            dt = timestamp - self.timestamp
+            dt = max(dt, 1e-6)  # Prevent division by zero
+            
+            # Normalize return by sqrt(dt) to get per-second vol
+            # Var(r/√dt) = Var(r)/dt, so σ_per_sec = σ_observed/√dt
+            normalized_return = log_return / math.sqrt(dt)
+            squared_return = normalized_return * normalized_return
+            
             if self.ewma_var is None:
                 self.ewma_var = squared_return
             else:
@@ -140,7 +142,6 @@ class AvellanedaStoikovPricer:
             
             self.stats['vol_updates'] += 1
         
-        # Update current state
         self.mid = midprice
         self.timestamp = timestamp
     
@@ -155,7 +156,6 @@ class AvellanedaStoikovPricer:
         timestamp = float(timestamp)
         self.trade_timestamps.append(timestamp)
         
-        # Clean old timestamps
         cutoff = timestamp - self.k_lookback_sec
         while self.trade_timestamps and self.trade_timestamps[0] < cutoff:
             self.trade_timestamps.popleft()
@@ -166,34 +166,25 @@ class AvellanedaStoikovPricer:
         """
         Estimate trade arrival rate k (events per second).
         Uses recent trade timestamps with smoothing.
-        
-        Conservative baseline: 0.1 events/sec (1 trade per 10 seconds)
-        This prevents extreme spreads while maintaining risk-adjusted pricing.
         """
         n_events = len(self.trade_timestamps)
         
         if n_events < 2:
-            # Use reasonable default: 0.1 events/sec = 1 trade per 10 seconds
-            # This is conservative for crypto pairs during normal activity
             return max(self.last_k_estimate, 0.1)
         
         time_span = self.trade_timestamps[-1] - self.trade_timestamps[0]
         
         if time_span <= 0:
-            # All events at same time, use event density with conservative floor
             return max(n_events / max(self.k_lookback_sec, 1.0), 0.1)
         
         raw_k = n_events / time_span
         
-        # Apply smoothing to avoid jumpy estimates
-        smoothing_factor = 0.1
+        smoothing_factor = 0.4
         self.last_k_estimate = (
             smoothing_factor * raw_k + 
             (1 - smoothing_factor) * self.last_k_estimate
         )
         
-        # Use minimum of 0.1 events/sec (1 trade per 10 seconds)
-        # This prevents unreasonably wide spreads while maintaining risk protection
         return max(self.last_k_estimate, 0.1)
     
     def update_inventory(self, inventory: float) -> None:
@@ -229,16 +220,44 @@ class AvellanedaStoikovPricer:
                                 midprice: float, 
                                 gamma: float, 
                                 sigma: float, 
-                                T: float) -> float:
+                                T: float,
+                                typical_order_size: float = 0.1) -> float:
         """
-        Calculate reservation (indifference) price.
+        Calculate reservation (indifference) price with professional inventory penalty.
         
-        r = s - inventory * gamma * sigma^2 * T
+        FIX #1: Keep adjustments in basis points (not dollar terms) to avoid over-scaling.
+        The A-S indifference price should shift by tens of bps, not thousands.
+        
+        r = s - adjustment_in_bps * s / 10000
         
         This represents the theoretical fair value adjusted for inventory risk.
         """
-        inventory_adjustment = self.inventory * gamma * (sigma ** 2) * T
-        return midprice - inventory_adjustment
+        if abs(self.inventory) < 1e-6:
+            # No inventory, no adjustment
+            return midprice
+        
+        # Standard A-S formula in fractional units
+        # inventory * gamma * sigma^2 * T gives adjustment as fraction of price
+        base_adjustment_fraction = self.inventory * gamma * (sigma ** 2) * T
+        
+        # Convert to basis points (1 bp = 0.0001 = 0.01%)
+        # Multiply by 10000 to get bps
+        adj_bp = base_adjustment_fraction * 1e4
+        
+        # FIX #1: Cap adjustment at ±10 bps (0.1% of price) for professional market making
+        # This prevents extreme quote skew that kills fill rate
+        # For $100k BTC: ±10 bps = ±$100 adjustment (reasonable for MM)
+        adj_bp = np.clip(adj_bp, -10.0, 10.0)
+        
+        # Convert back to price adjustment
+        scaled_adjustment = adj_bp * midprice / 1e4
+        
+        # Log significant adjustments (>2 bps) to monitor effectiveness
+        if abs(adj_bp) > 2.0:
+            logger.debug(f"Inventory penalty: position={self.inventory:.4f}, "
+                        f"adjustment={adj_bp:.2f} bps (${scaled_adjustment:.2f})")
+        
+        return midprice - scaled_adjustment
     
     def compute_optimal_half_spread(self, 
                                   gamma: float, 
@@ -253,7 +272,8 @@ class AvellanedaStoikovPricer:
         First term: risk premium
         Second term: adverse selection protection
         
-        With practical caps to prevent extreme spreads in low-activity periods.
+        FIX #2: Adaptive cap based on volatility (not fixed 10 bps).
+        FIX #5: Dynamic spread widening in volatile periods.
         """
         # Ensure positive parameters with reasonable floors
         k = max(k, 0.1)  # Minimum 0.1 events/sec (1 per 10 seconds)
@@ -265,24 +285,36 @@ class AvellanedaStoikovPricer:
         
         # Adverse selection component with practical limits
         gamma_over_k = gamma / k
-        # Cap the ratio to keep spreads competitive
-        # For gamma=0.02, k=0.1: ratio=0.2 → ln(1.2)=0.18 → spread reasonable
-        gamma_over_k = min(gamma_over_k, 10.0)  # Cap at 10 for competitive spreads
+        gamma_over_k = min(gamma_over_k, 2.0)  # Cap for competitive spreads
+        
         adverse_selection = (1.0 / gamma) * math.log(1.0 + gamma_over_k)
+        adverse_selection = min(adverse_selection, 0.01)  # Max 1% from adverse selection
         
         # Calculate raw half-spread
         total_half_spread = risk_premium + adverse_selection
         
-        # CRITICAL FIX: Cap half-spread at 2% (4% total spread maximum)
-        # This prevents unreasonably wide spreads from volatile estimates
-        # For crypto MM, spreads > 5% total are uncompetitive
-        max_half_spread_absolute = 0.02  # 2% maximum half-spread
+        # FIX #5: Dynamic spread widening by volatility
+        # Widen spread in volatile periods: ~1 bp per 0.0001 sigma
+        # For sigma=0.001 (10 bps vol): multiply by ~2x
+        # For sigma=0.0001 (1 bp vol): multiply by ~1.1x
+        volatility_multiplier = 1.0 + min(2.0, sigma * 1e4)
+        total_half_spread *= volatility_multiplier
         
-        if total_half_spread > max_half_spread_absolute:
-            logger.warning(f"Half-spread {total_half_spread:.6f} exceeds max {max_half_spread_absolute:.6f}. "
+        # FIX #2: Adaptive cap based on volatility (not fixed)
+        # In low liquidity or high vol, allow wider spreads (up to 50 bps = 0.5%)
+        # In normal conditions, keep tight (10 bps = 0.1%)
+        # Formula: min(0.005, 2*sigma) ensures cap scales with market conditions
+        # Examples:
+        #   - sigma=0.0001 (calm): cap = 0.0002 (2 bps) - very tight
+        #   - sigma=0.0005 (normal): cap = 0.001 (10 bps) - competitive
+        #   - sigma=0.005 (volatile): cap = 0.005 (50 bps) - wider for risk
+        max_half_spread_adaptive = min(0.005, 2.0 * sigma)
+        
+        if total_half_spread > max_half_spread_adaptive:
+            logger.debug(f"Half-spread {total_half_spread:.6f} capped at {max_half_spread_adaptive:.6f}. "
                          f"Params: gamma={gamma:.4f}, sigma={sigma:.6f}, T={T:.1f}, k={k:.4f}, "
-                         f"risk_prem={risk_premium:.6f}, adv_sel={adverse_selection:.6f}")
-            total_half_spread = max_half_spread_absolute
+                         f"vol_mult={volatility_multiplier:.2f}")
+            total_half_spread = max_half_spread_adaptive
         
         return total_half_spread
     
@@ -305,7 +337,7 @@ class AvellanedaStoikovPricer:
         inventory_factor = max(0.1, 1.0 - inventory_ratio * 0.8)
         
         # Volatility adjustment - reduce size in high volatility
-        vol_factor = max(0.2, 1.0 / (1.0 + volatility * 100))
+        vol_factor = 1.0 / (1.0 + 10 * volatility / 0.001) 
         
         # Side-specific adjustment based on inventory
         if side == 'bid' and self.inventory > 0:
@@ -400,6 +432,9 @@ class AvellanedaStoikovPricer:
         """
         Generate optimal bid/ask quotes using Avellaneda-Stoikov framework.
         
+        FIX #6: Asymmetric spread adjustment for inventory mean-reversion.
+        FIX #7: Adaptive gamma and T based on volatility regime.
+        
         Args:
             params: Quote generation parameters (gamma, T, k, min_spread)
             midprice: Current midprice (optional, uses last observed)
@@ -423,21 +458,64 @@ class AvellanedaStoikovPricer:
         sigma = self.get_instantaneous_volatility()
         k = params.k if params.k is not None else self.estimate_arrival_rate()
         
-        # Calculate reservation price and optimal spread
-        reservation_price = self.compute_reservation_price(s, params.gamma, sigma, params.T)
-        half_spread = self.compute_optimal_half_spread(params.gamma, sigma, params.T, k)
+        # FIX #7: Adaptive gamma - increase risk aversion in volatile markets
+        # Base gamma scales up with realized volatility
+        # Normal vol (0.001): gamma_eff ≈ gamma
+        # High vol (0.005): gamma_eff ≈ 6*gamma (much more risk averse)
+        base_gamma = params.gamma
+        gamma_eff = base_gamma * (1.0 + sigma / 0.001)
         
-        # Debug logging for spread components (only log occasionally to avoid spam)
+        # FIX #7: Adaptive T - reduce exposure time in fast markets
+        # When volatility spikes, use shorter horizon for risk management
+        # Normal vol (0.001): T_eff = T
+        # High vol (0.005): T_eff ≈ T/6 (rebalance more frequently)
+        base_T = params.T
+        T_eff = max(5.0, base_T / (1.0 + sigma / 0.001))
+        
+        # Log adaptive parameters occasionally
         if self.stats['quotes_generated'] % 100 == 0:
-            logger.debug(f"Spread calculation: sigma={sigma:.6f}, k={k:.4f}, gamma={params.gamma:.4f}, "
-                        f"T={params.T:.1f}s → half_spread={half_spread:.6f} ({half_spread*100:.2f}%)")
+            logger.debug(f"Adaptive params: sigma={sigma:.6f} → "
+                        f"gamma {base_gamma:.4f}→{gamma_eff:.4f}, "
+                        f"T {base_T:.1f}s→{T_eff:.1f}s")
+        
+        # Calculate typical order size for inventory penalty scaling
+        typical_quote_size = self.calculate_quote_size(s, sigma, 'bid')
+        
+        # Calculate reservation price with adaptive inventory penalty
+        reservation_price = self.compute_reservation_price(
+            s, gamma_eff, sigma, T_eff, 
+            typical_order_size=max(typical_quote_size, 0.01)
+        )
+        half_spread = self.compute_optimal_half_spread(gamma_eff, sigma, T_eff, k)
         
         # Apply minimum spread constraint
         half_spread = max(half_spread, params.min_spread / 2.0)
         
-        # Generate raw quotes
+        # Generate raw quotes (symmetric around reservation price)
         raw_bid = reservation_price - half_spread
         raw_ask = reservation_price + half_spread
+        
+        # FIX #6: Asymmetric spread adjustment for inventory mean-reversion
+        # Instead of just shifting reservation price, also adjust individual sides
+        # This makes one side more aggressive (tighter) to encourage mean-reversion
+        # While keeping the other side wider for protection
+        if abs(self.inventory) > 1e-6:
+            inventory_ratio = self.inventory / self.max_inventory
+            # Adjustment factor: 20% of half-spread (prevents over-tightening)
+            asymmetric_adjustment = half_spread * 0.2 * abs(inventory_ratio)
+            
+            if self.inventory > 0:  # Long position - want to sell
+                raw_ask -= asymmetric_adjustment  # Make sells more aggressive (tighter)
+                raw_bid -= asymmetric_adjustment  # Make buys less aggressive (wider)
+                if self.stats['quotes_generated'] % 500 == 0:
+                    logger.debug(f"Long inventory {self.inventory:.4f}: "
+                                f"tightening ask by ${asymmetric_adjustment:.2f}")
+            else:  # Short position - want to buy
+                raw_bid += asymmetric_adjustment  # Make buys more aggressive (tighter)
+                raw_ask += asymmetric_adjustment  # Make sells less aggressive (wider)
+                if self.stats['quotes_generated'] % 500 == 0:
+                    logger.debug(f"Short inventory {self.inventory:.4f}: "
+                                f"tightening bid by ${asymmetric_adjustment:.2f}")
         
         # Apply risk controls
         bid, ask = self.apply_risk_controls(raw_bid, raw_ask, s)
@@ -467,50 +545,66 @@ class AvellanedaStoikovPricer:
             confidence=confidence
         )
         
-        logger.debug(f"Generated quote: bid={bid:.4f} ask={ask:.4f} "
-                    f"spread={ask-bid:.4f} ({spread_bps:.1f}bps)")
-        
         return quote
     
     def _calculate_quote_confidence(self, sigma: float, k: float) -> float:
         """
         Calculate confidence in the generated quote based on market conditions.
         
+        FIX #4: Allow confidence to drop to 0.2 in truly bad conditions.
+        This enables skipping quotes when market data is stale or extreme.
+        
         Higher confidence when:
         - Volatility is stable (not too high/low)
         - Trade arrival rate is consistent
         - Recent market activity is normal
         """
-        # Volatility confidence - accept a wide range of volatility
-        # Most crypto volatility is between 0.0001 and 0.01 (1-100 bps)
+        # Volatility confidence - be more realistic about extreme conditions
         if sigma < 1e-6:
-            vol_confidence = 0.3  # Very low vol - less confident
+            vol_confidence = 0.2  # Extremely low vol - possibly stale data
         elif sigma < 0.001:
-            vol_confidence = 0.9  # Normal vol range
+            vol_confidence = 0.9  # Normal vol range (1-10 bps)
         elif sigma < 0.01:
-            vol_confidence = 0.8  # Higher vol - still good
+            vol_confidence = 0.8  # Higher vol (10-100 bps) - still good
+        elif sigma < 0.05:
+            vol_confidence = 0.5  # Very high vol (100-500 bps) - be cautious
         else:
-            vol_confidence = 0.6  # Very high vol - be cautious
+            vol_confidence = 0.2  # Extreme vol (>500 bps) - likely anomaly
         
-        # Arrival rate confidence - be more permissive
-        if k < 1e-6:
-            k_confidence = 0.5  # No trades yet, but don't block completely
+        # Arrival rate confidence - penalize very low activity
+        if k < 0.001:
+            k_confidence = 0.2  # Almost no trades - market may be halted
         elif k < 0.01:
-            k_confidence = 0.8  # Low activity is ok
+            k_confidence = 0.6  # Low activity (< 1 trade per 100 sec)
+        elif k < 0.1:
+            k_confidence = 0.8  # Moderate activity
         else:
-            k_confidence = 0.9  # Good activity
+            k_confidence = 0.9  # Good activity (> 1 trade per 10 sec)
         
-        # Market data freshness
+        # Market data freshness - be stricter about stale data
         if self.timestamp:
             data_age = time.time() - self.timestamp
-            freshness_confidence = max(0.5, 1.0 - data_age / 60.0)  # 1 minute window
+            if data_age > 60.0:
+                freshness_confidence = 0.2  # Data older than 1 minute - don't quote
+            elif data_age > 30.0:
+                freshness_confidence = 0.5  # Data 30-60s old - be cautious
+            elif data_age > 10.0:
+                freshness_confidence = 0.7  # Data 10-30s old - acceptable
+            else:
+                freshness_confidence = 1.0  # Fresh data (< 10s)
         else:
-            freshness_confidence = 0.7  # No timestamp, but still quote
+            freshness_confidence = 0.3  # No timestamp - very suspicious
         
-        # Combine factors with weighted average (not geometric mean which is too strict)
-        overall_confidence = (vol_confidence * 0.4 + k_confidence * 0.3 + freshness_confidence * 0.3)
+        # Combine factors with weighted average
+        overall_confidence = (
+            vol_confidence * 0.4 + 
+            k_confidence * 0.3 + 
+            freshness_confidence * 0.3
+        )
         
-        return max(0.5, min(1.0, overall_confidence))  # Always return at least 0.5
+        # FIX #4: Allow confidence as low as 0.2 (was 0.5 minimum)
+        # Caller can use confidence < 0.5 threshold to skip quoting
+        return max(0.2, min(1.0, overall_confidence))
     
     def get_market_state(self) -> Dict:
         """Get current market state and parameters"""

@@ -45,7 +45,7 @@ class RiskLimits:
     """Risk limit configuration"""
     max_position: float = 10.0
     max_daily_loss: float = 1000.0
-    max_drawdown: float = 0.30  # 30% - more realistic for market making
+    max_drawdown: float = 0.50  # 50% for backtesting (use 0.30 for live trading)
     max_leverage: float = 3.0
     max_var_95: float = 500.0
     latency_threshold_ms: float = 100.0
@@ -81,6 +81,7 @@ class RiskManager:
         # Performance tracking
         self.pnl_history: List[Tuple[float, float]] = []  # (timestamp, pnl)
         self.trade_history: List[Dict] = []
+        self.fill_history: List[Tuple[float, float]] = []  # (timestamp, fill_size) for fill rate tracking
         self.latency_samples: List[float] = []
         
         # Risk state
@@ -189,10 +190,29 @@ class RiskManager:
             if len(self.latency_samples) > 1000:
                 self.latency_samples = self.latency_samples[-1000:]
     
+    def record_fill(self, timestamp: float, fill_size: float) -> None:
+        """
+        Record a fill event for tracking fill frequency.
+        Used for dynamic position limit calculation.
+        """
+        with self._lock:
+            self.fill_history.append((timestamp, fill_size))
+            
+            # Keep only recent fills (last 1000 fills or 24 hours)
+            cutoff_time = timestamp - 86400  # 24 hours
+            self.fill_history = [(ts, size) for ts, size in self.fill_history 
+                                if ts >= cutoff_time][-1000:]
+    
     def check_quote_risk(self, quote: MarketQuote, current_price: float) -> bool:
         """
         Check if a quote is acceptable from risk perspective.
         Returns True if quote should be allowed, False to block.
+        
+        DYNAMIC POSITION LIMITS:
+        - Calculates adaptive position limits based on recent trade frequency
+        - Higher trade frequency → tighter position limits (true market making)
+        - Lower trade frequency → wider limits (allow some directional exposure)
+        - Works generically for any asset, not BTC-specific
         """
         with self._lock:
             self.stats['risk_checks'] += 1
@@ -208,16 +228,48 @@ class RiskManager:
                 self.stats['quotes_blocked'] += 1
                 return False
             
-            # Check position limits
-            max_bid_size = self.limits.max_position - self.current_position
-            max_ask_size = self.limits.max_position + self.current_position
+            # DYNAMIC POSITION LIMIT CALCULATION
+            # Base limit from config, but adjust based on market making health
+            base_limit = self.limits.max_position
+            limit_multiplier = 1.0  # Default: use full base limit
+            
+            # Calculate recent trade frequency (trades per hour) if we have enough data
+            if len(self.fill_history) >= 10:
+                recent_fills = self.fill_history[-50:] if len(self.fill_history) >= 50 else self.fill_history
+                
+                if len(recent_fills) >= 2:  # Need at least 2 fills to calculate span
+                    time_span = recent_fills[-1][0] - recent_fills[0][0]  # seconds
+                    
+                    if time_span > 0:
+                        fills_per_hour = (len(recent_fills) / time_span) * 3600
+                        
+                        # TRUE HFT: 100+ trades/hour → tighten position limit to 20% of max
+                        # SLOW MM: <10 trades/hour → allow up to 100% of max
+                        # Formula: limit_multiplier = 0.2 + 0.8 * exp(-fills_per_hour / 50)
+                        # This creates smooth decay:
+                        #   - 10 fills/hour → 82% of max limit
+                        #   - 50 fills/hour → 49% of max limit
+                        #   - 100 fills/hour → 29% of max limit (tight HFT control)
+                        limit_multiplier = 0.2 + 0.8 * np.exp(-fills_per_hour / 50.0)
+                        
+                        # Log position limit adjustment (only occasionally to avoid spam)
+                        if self.stats['risk_checks'] % 100 == 0:
+                            logger.debug(f"Dynamic position limit: {base_limit * limit_multiplier:.4f} "
+                                       f"(base: {base_limit:.4f}, multiplier: {limit_multiplier:.2f}, "
+                                       f"fills/hr: {fills_per_hour:.1f})")
+            
+            dynamic_limit = base_limit * limit_multiplier
+            
+            # Check position limits with dynamic adjustment
+            max_bid_size = dynamic_limit - self.current_position
+            max_ask_size = dynamic_limit + self.current_position
             
             if quote.bid_size > max_bid_size and max_bid_size > 0:
-                logger.warning(f"Bid size {quote.bid_size:.4f} exceeds position limit")
+                logger.warning(f"Bid size {quote.bid_size:.4f} exceeds dynamic position limit {max_bid_size:.4f}")
                 return False
             
             if quote.ask_size > max_ask_size and max_ask_size > 0:
-                logger.warning(f"Ask size {quote.ask_size:.4f} exceeds position limit") 
+                logger.warning(f"Ask size {quote.ask_size:.4f} exceeds dynamic position limit {max_ask_size:.4f}") 
                 return False
             
             # Check drawdown limits

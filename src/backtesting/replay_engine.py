@@ -8,13 +8,16 @@ Exactly replicates live trading conditions for accurate strategy testing.
 
 import time
 import json
+import logging
 from typing import Dict, List, Optional, Iterator, Callable, Any
 from dataclasses import dataclass
 from datetime import timezone
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from loguru import logger
+
+# Use standard logging instead of loguru
+logger = logging.getLogger(__name__)
 
 from src.data_ingestion.order_book import OrderBook, OrderBookSnapshot
 from src.data_ingestion.binance_historical import BinanceHistoricalDataFetcher
@@ -73,7 +76,7 @@ class HistoricalDataLoader:
                 logger.error(f"No real market data available from Binance for {symbol} in specified period")
                 return
             
-            logger.success(f"Retrieved {len(kline_data)} minutes of real market data from Binance")
+            logger.info(f"Retrieved {len(kline_data)} minutes of real market data from Binance")
             
             # Generate realistic order book snapshots from real kline data
             order_book_updates = self.binance_fetcher.simulate_order_book_from_klines(kline_data)
@@ -222,7 +225,7 @@ class OrderBookReplayEngine:
             self.end_time = time.time()
             self.stats['replay_duration_sec'] = self.end_time - self.start_time
             
-            logger.success(f"Backtest completed: {self.events_processed}/{self.events_total} events processed")
+            logger.info(f"Backtest completed: {self.events_processed}/{self.events_total} events processed")
             
             return self._generate_results()
             

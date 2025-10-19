@@ -111,7 +111,7 @@ class LiveAvellanedaStoikov:
                     # Track quote frequency
                     self.quote_update_frequency.append(timestamp)
                     
-                    self.logger.debug(f"Generated quotes: BID={quotes['bid']:.4f}, ASK={quotes['ask']:.4f}")
+                    # self.logger.debug(f"Generated quotes: BID={quotes['bid']:.4f}, ASK={quotes['ask']:.4f}")
                     return quotes
             
             return None
@@ -224,7 +224,7 @@ class LiveAvellanedaStoikov:
                 self.logger.warning("No current midprice available")
                 return None
             
-            self.logger.debug(f"Generating quotes with midprice={self.current_midprice}")
+            # self.logger.debug(f"Generating quotes with midprice={self.current_midprice}")
             
             # Get optimal quotes from strategy
             bid_price, ask_price = self.pricer.compute_quotes(
@@ -249,7 +249,7 @@ class LiveAvellanedaStoikov:
                 'volatility': self.current_volatility or 0.0
             }
             
-            self.logger.info(f"Generated quotes: BID={bid_price:.4f}({quote_size}) ASK={ask_price:.4f}({quote_size})")
+            # self.logger.info(f"Generated quotes: BID={bid_price:.4f}({quote_size}) ASK={ask_price:.4f}({quote_size})")
             return quotes
             
         except Exception as e:

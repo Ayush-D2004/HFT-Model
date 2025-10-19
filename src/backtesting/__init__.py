@@ -21,6 +21,12 @@ from .fill_simulator import (
     FillReason,
     MarketState
 )
+from .fill_simulator_fifo import (
+    FIFOFillSimulator,
+    LimitOrder,
+    TradeEvent,
+    LOBSnapshot
+)
 from .metrics import (
     BacktestMetrics,
     PerformanceMetrics
@@ -41,6 +47,10 @@ __all__ = [
     'FillEvent', 
     'FillReason',
     'MarketState',
+    'FIFOFillSimulator',
+    'LimitOrder',
+    'TradeEvent',
+    'LOBSnapshot',
     'BacktestMetrics',
     'PerformanceMetrics',
     'BacktestEngine',

@@ -165,8 +165,8 @@ class QuoteManager:
                 self.current_quote = quote
                 self.stats['quotes_generated'] += 1
                 
-                logger.debug(f"Quote generated: {quote.bid_price:.4f} x {quote.ask_price:.4f} "
-                           f"({quote.spread:.4f})")
+                # logger.debug(f"Quote generated: {quote.bid_price:.4f} x {quote.ask_price:.4f} "
+                        #    f"({quote.spread:.4f})")
                 
                 return quote
                 

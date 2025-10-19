@@ -88,8 +88,8 @@ def create_backtesting_section():
                 help="Starting capital in USDT. Typical: $5k-50k for retail, $100k+ for institutional"
             )
             
-            gamma = st.slider("Risk Aversion (γ)", 0.005, 0.10, 0.015, 0.005, key="bt_gamma",
-                            help="Lower = tighter spreads. HFT optimal: 0.01-0.02. Lower = more aggressive")
+            gamma = st.slider("Risk Aversion (γ)", 0.005, 0.05, 0.015, 0.005, key="bt_gamma",
+                            help="Lower = tighter spreads. HFT optimal: 0.01-0.02. Max 0.05 to prevent uncompetitive spreads.")
             time_horizon = st.slider("Time Horizon (sec)", 5, 60, 10, 5, key="bt_time_horizon",
                                    help="Quote refresh time. HFT optimal: 5-15 seconds. Shorter = faster adaptation")
             min_spread = st.number_input("Min Spread", 0.0001, 0.01, 0.0005, 0.0001, key="bt_min_spread",
@@ -167,8 +167,8 @@ def create_live_trading_section():
                 help="Starting capital in USDT. Typical: $5k-50k for retail"
             )
             
-            gamma = st.slider("Risk Aversion (γ)", 0.005, 0.10, 0.015, 0.005, key="live_gamma",
-                            help="Lower = tighter spreads. HFT optimal: 0.01-0.02")
+            gamma = st.slider("Risk Aversion (γ)", 0.005, 0.05, 0.015, 0.005, key="live_gamma",
+                            help="Lower = tighter spreads. HFT optimal: 0.01-0.02. Max 0.05 to prevent uncompetitive spreads.")
             time_horizon = st.slider("Time Horizon (sec)", 5, 60, 10, 5, key="live_time_horizon",
                                    help="Quote refresh time. HFT optimal: 5-15s")
             min_spread = st.number_input("Min Spread", 0.0001, 0.01, 0.0005, 0.0001, key="live_min_spread",
@@ -281,17 +281,22 @@ def display_backtest_results(results):
             
             # Diagnostic checks for zero results
             if perf.total_trades == 0:
-                st.warning("⚠️ **No Trades Executed**")
+                st.error("❌ **No Trades Executed - Strategy Not Working!**")
                 
                 with st.expander("📊 Why No Trades? Diagnostics", expanded=True):
                     st.markdown("""
                     ### Possible Reasons for Zero Trades:
                     
-                    **1. Spread Too Wide**
+                    **1. ⚠️ CRITICAL: Gamma Too High**
+                    - If you set gamma > 0.05, spreads become uncompetitive (6%+ wide)
+                    - The adverse selection term: `(1/gamma) * ln(1 + gamma/k)` explodes with high gamma
+                    - **Solution:** Set gamma to 0.01-0.03 (HFT optimal range)
+                    
+                    **2. Spread Too Wide**
                     - Your quotes may be too far from market price
                     - Try reducing `gamma` (risk aversion) - lower values = tighter spreads
                     - Try reducing `time_horizon` - shorter horizons = tighter spreads
-                    - Recommended: gamma=0.01-0.05, time_horizon=10-30 seconds
+                    - Recommended: gamma=0.01-0.03, time_horizon=10-20 seconds
                     
                     **2. Min Spread Too High**
                     - If `min_spread` is set too high, quotes won't be competitive
@@ -379,6 +384,327 @@ def display_backtest_results(results):
             st.plotly_chart(fig_pnl, use_container_width=True)
         else:
             st.info("No P&L history data available for charting")
+        
+        # ============================================
+        # COMPREHENSIVE PERFORMANCE ANALYSIS CHARTS
+        # ============================================
+        if hasattr(results, 'metrics'):
+            metrics = results.metrics
+            perf = results.performance
+            
+            st.markdown("---")
+            st.subheader("📊 Performance Analysis")
+            
+            # Get trade data
+            trades = metrics.trades if hasattr(metrics, 'trades') else []
+            position_series = metrics.position_series if hasattr(metrics, 'position_series') else []
+            pnl_series = metrics.pnl_series if hasattr(metrics, 'pnl_series') else []
+            
+            if len(trades) > 0:
+                # Prepare trade data
+                trade_pnls = [t['pnl'] for t in trades]
+                trade_times = [t['timestamp'] for t in trades]
+                winning_trades = [p for p in trade_pnls if p > 0]
+                losing_trades = [p for p in trade_pnls if p < 0]
+                
+                # Create subplot figure with 3x2 grid (5 charts total)
+                from plotly.subplots import make_subplots
+                
+                fig = make_subplots(
+                    rows=3, cols=2,
+                    subplot_titles=(
+                        'Trade P&L Distribution (Histogram)',
+                        'Position Over Time (Inventory)',
+                        'Drawdown Over Time',
+                        'Rolling Sharpe Ratio (30-trade window)',
+                        'Cumulative Trade P&L vs Total P&L',
+                        ''  # Empty 6th subplot
+                    ),
+                    specs=[
+                        [{"type": "xy"}, {"type": "xy"}],
+                        [{"type": "xy"}, {"type": "xy"}],
+                        [{"type": "xy"}, {"type": "xy"}]
+                    ],
+                    vertical_spacing=0.12,
+                    horizontal_spacing=0.12
+                )
+                
+                # 1. Trade P&L Histogram
+                fig.add_trace(
+                    go.Histogram(
+                        x=trade_pnls,
+                        nbinsx=30,
+                        marker_color='lightblue',
+                        name='Trade P&L',
+                        showlegend=False
+                    ),
+                    row=1, col=1
+                )
+                
+                # 2. Position/Inventory Over Time
+                if position_series:
+                    pos_times = [p[0] for p in position_series]
+                    pos_values = [p[1] for p in position_series]
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=pos_times,
+                            y=pos_values,
+                            mode='lines',
+                            line=dict(color='purple', width=2),
+                            fill='tozeroy',
+                            name='Position',
+                            showlegend=False
+                        ),
+                        row=1, col=2
+                    )
+                    
+                    # Add zero line
+                    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=1, col=2)
+                
+                # 3. Drawdown Over Time
+                if pnl_series:
+                    pnl_vals = [p[1] for p in pnl_series]
+                    pnl_times = [p[0] for p in pnl_series]
+                    
+                    # Calculate drawdown
+                    running_max = np.maximum.accumulate(pnl_vals)
+                    drawdown = [(pnl - rmax) for pnl, rmax in zip(pnl_vals, running_max)]
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=pnl_times,
+                            y=drawdown,
+                            mode='lines',
+                            line=dict(color='red', width=2),
+                            fill='tozeroy',
+                            fillcolor='rgba(255, 0, 0, 0.2)',
+                            name='Drawdown',
+                            showlegend=False
+                        ),
+                        row=2, col=1
+                    )
+                
+                # 4. Rolling Sharpe Ratio
+                if len(trade_pnls) > 30:
+                    window = 30
+                    rolling_sharpe = []
+                    rolling_times = []
+                    
+                    for i in range(window, len(trade_pnls)):
+                        window_pnls = trade_pnls[i-window:i]
+                        if np.std(window_pnls) > 0:
+                            sharpe = np.mean(window_pnls) / np.std(window_pnls) * np.sqrt(252)  # Annualized
+                            rolling_sharpe.append(sharpe)
+                            rolling_times.append(trade_times[i])
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=rolling_times,
+                            y=rolling_sharpe,
+                            mode='lines',
+                            line=dict(color='blue', width=2),
+                            name='Rolling Sharpe',
+                            showlegend=False
+                        ),
+                        row=2, col=2
+                    )
+                    
+                    # Add zero line
+                    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=2, col=2)
+                
+                # 5. Cumulative Trade P&L vs Total P&L
+                cumulative_trade_pnl = np.cumsum(trade_pnls)
+                
+                fig.add_trace(
+                    go.Scatter(
+                        x=trade_times,
+                        y=cumulative_trade_pnl,
+                        mode='lines',
+                        line=dict(color='green', width=2),
+                        name='Realized P&L (Closed Trades)',
+                    ),
+                    row=3, col=1
+                )
+                
+                if pnl_series:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[p[0] for p in pnl_series],
+                            y=[p[1] for p in pnl_series],
+                            mode='lines',
+                            line=dict(color='orange', width=2, dash='dash'),
+                            name='Total P&L (Inc. Unrealized)',
+                        ),
+                        row=3, col=1
+                    )
+                
+                # Update axes labels
+                # Row 1, Col 1: Histogram
+                fig.update_xaxes(title_text="Trade P&L ($)", row=1, col=1)
+                fig.update_yaxes(title_text="Frequency", row=1, col=1)
+                
+                # Row 1, Col 2: Position
+                fig.update_xaxes(title_text="Time", row=1, col=2)
+                fig.update_yaxes(title_text="Position (BTC)", row=1, col=2)
+                
+                # Row 2, Col 1: Drawdown
+                fig.update_xaxes(title_text="Time", row=2, col=1)
+                fig.update_yaxes(title_text="Drawdown ($)", row=2, col=1)
+                
+                # Row 2, Col 2: Rolling Sharpe
+                fig.update_xaxes(title_text="Time", row=2, col=2)
+                fig.update_yaxes(title_text="Sharpe Ratio", row=2, col=2)
+                
+                # Row 3, Col 1: Cumulative P&L
+                fig.update_xaxes(title_text="Time", row=3, col=1)
+                fig.update_yaxes(title_text="P&L ($)", row=3, col=1)
+                
+                # Update layout
+                fig.update_layout(
+                    height=1200,
+                    showlegend=True,
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=-0.05,
+                        xanchor="center",
+                        x=0.5
+                    )
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # ============================================
+                # KEY INSIGHTS SECTION
+                # ============================================
+                st.markdown("---")
+                st.subheader("🔍 Key Insights & Diagnostics")
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.markdown("**📈 P&L Analysis**")
+                    realized_pnl = sum(trade_pnls)
+                    total_pnl = getattr(perf, 'total_pnl', 0)
+                    unrealized_pnl = total_pnl - realized_pnl
+                    
+                    st.write(f"Realized P&L: ${realized_pnl:.2f}")
+                    st.write(f"Unrealized P&L: ${unrealized_pnl:.2f}")
+                    st.write(f"Total P&L: ${total_pnl:.2f}")
+                    
+                    if abs(unrealized_pnl) > abs(realized_pnl):
+                        st.warning(f"⚠️ Large open position! Unrealized P&L (${unrealized_pnl:.2f}) > Realized P&L")
+                    
+                with col2:
+                    st.markdown("**🎯 Trade Quality**")
+                    if len(winning_trades) > 0 and len(losing_trades) > 0:
+                        avg_win = np.mean(winning_trades)
+                        avg_loss = np.mean(losing_trades)
+                        win_loss_ratio = abs(avg_win / avg_loss)
+                        
+                        st.write(f"Avg Win: ${avg_win:.2f}")
+                        st.write(f"Avg Loss: ${avg_loss:.2f}")
+                        st.write(f"Win/Loss Ratio: {win_loss_ratio:.2f}x")
+                        
+                        if win_loss_ratio < 1.0:
+                            st.warning("⚠️ Average losses > average wins!")
+                        elif win_loss_ratio > 2.0:
+                            st.success("✅ Good risk/reward ratio")
+                
+                with col3:
+                    st.markdown("**⚖️ Market Making Health**")
+                    fill_rate = getattr(perf, 'fill_rate', 0)
+                    
+                    if position_series:
+                        final_position = position_series[-1][1] if position_series else 0
+                        st.write(f"Final Position: {final_position:.4f} BTC")
+                        
+                        if abs(final_position) > 0.1:
+                            st.warning(f"⚠️ Not market-neutral! Holding {final_position:.4f} BTC")
+                        else:
+                            st.success("✅ Near-flat position")
+                    
+                    st.write(f"Fill Rate: {fill_rate:.1%}")
+                    if fill_rate < 0.3:
+                        st.error("❌ Fill rate too low (<30%)")
+                    elif fill_rate < 0.5:
+                        st.warning("⚠️ Fill rate below target (30-50%)")
+                    elif fill_rate < 0.7:
+                        st.info("📊 Moderate fill rate (50-70%)")
+                    else:
+                        st.success("✅ Good fill rate (70%+)")
+        
+        # Debug: Show raw trade data + outlier detection
+        if hasattr(results, 'metrics') and hasattr(results.metrics, 'trades'):
+            with st.expander("🔍 Debug: Trade P&L Data & Outlier Detection", expanded=False):
+                trades = results.metrics.trades
+                st.write(f"**Total Trades:** {len(trades)}")
+                
+                if len(trades) > 0:
+                    trade_pnls = [t['pnl'] for t in trades]
+                    st.write(f"**Sum of Trade P&Ls:** ${sum(trade_pnls):.2f}")
+                    
+                    winning_trades_count = len([p for p in trade_pnls if p > 0])
+                    losing_trades_count = len([p for p in trade_pnls if p < 0])
+                    zero_trades_count = len([p for p in trade_pnls if p == 0])
+                    
+                    st.write(f"**Winning Trades (pnl > 0):** {winning_trades_count}")
+                    st.write(f"**Losing Trades (pnl < 0):** {losing_trades_count}")
+                    st.write(f"**Zero P&L Trades (pnl == 0):** {zero_trades_count}")
+                    
+                    st.write(f"**First 10 Trade P&Ls:** {trade_pnls[:10]}")
+                    st.write(f"**Last 10 Trade P&Ls:** {trade_pnls[-10:]}")
+                    
+                    # DYNAMIC OUTLIER DETECTION
+                    st.markdown("---")
+                    st.markdown("### 📊 Statistical Outlier Analysis")
+                    
+                    outlier_analysis = results.metrics.detect_trade_outliers(std_threshold=3.0)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Outlier Trades", 
+                                 f"{outlier_analysis['outlier_count']} ({outlier_analysis['outlier_pct']:.1f}%)")
+                    with col2:
+                        st.metric("Avg P&L (Normal)", 
+                                 f"${outlier_analysis['mean_normal']:.2f}",
+                                 delta=f"{outlier_analysis['mean_with_outliers'] - outlier_analysis['mean_normal']:.2f}")
+                    with col3:
+                        st.metric("Outlier Impact", 
+                                 f"${outlier_analysis['total_outlier_impact']:.2f}")
+                    
+                    if outlier_analysis['outlier_count'] > 0:
+                        st.warning(f"⚠️ **{outlier_analysis['outlier_count']} outlier trades detected** "
+                                  f"(>{outlier_analysis['z_threshold']}σ from mean)")
+                        
+                        st.write("**Outlier Details:**")
+                        for i, trade in enumerate(outlier_analysis['outlier_trades'][:5]):  # Show first 5
+                            st.write(f"  - Trade #{i+1}: P&L=${trade['pnl']:.2f}, "
+                                   f"Side={trade['side']}, Qty={trade['quantity']:.4f}")
+                        
+                        if len(outlier_analysis['outlier_trades']) > 5:
+                            st.write(f"  ... and {len(outlier_analysis['outlier_trades']) - 5} more")
+                        
+                        # Adjusted metrics
+                        st.info(f"💡 **Adjusted Avg P&L (excluding outliers):** ${outlier_analysis['mean_normal']:.2f} per trade")
+                        st.info(f"📉 **This is {abs(outlier_analysis['mean_with_outliers'] - outlier_analysis['mean_normal']) / outlier_analysis['mean_with_outliers'] * 100:.1f}% "
+                               f"{'lower' if outlier_analysis['mean_normal'] < outlier_analysis['mean_with_outliers'] else 'higher'} "
+                               f"than reported avg**")
+                    else:
+                        st.success("✅ No statistical outliers detected - all trades within 3σ of mean")
+                trades = results.metrics.trades
+                if len(trades) > 0:
+                    trade_pnls = [t['pnl'] for t in trades]
+                    st.write(f"**Total Trades:** {len(trades)}")
+                    st.write(f"**Sum of Trade P&Ls:** ${sum(trade_pnls):.2f}")
+                    st.write(f"**Winning Trades (pnl > 0):** {len([p for p in trade_pnls if p > 0])}")
+                    st.write(f"**Losing Trades (pnl < 0):** {len([p for p in trade_pnls if p < 0])}")
+                    st.write(f"**Zero P&L Trades (pnl == 0):** {len([p for p in trade_pnls if p == 0])}")
+                    st.write(f"**First 10 Trade P&Ls:** {trade_pnls[:10]}")
+                    st.write(f"**Last 10 Trade P&Ls:** {trade_pnls[-10:]}")
+                else:
+                    st.write("No trades recorded")
         
         # Additional metrics
         with st.expander("Detailed Metrics"):

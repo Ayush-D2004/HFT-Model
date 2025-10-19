@@ -12,6 +12,7 @@ Comprehensive backtesting framework that integrates:
 
 import time
 import json
+import logging
 from typing import Dict, List, Optional, Callable, Any, Tuple
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -19,12 +20,14 @@ import numpy as np
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
 import itertools
-from loguru import logger
+
+# Use standard logging instead of loguru
+logger = logging.getLogger(__name__)
 
 from src.utils.logger import setup_backtesting_logging, setup_development_logging
 
 from .replay_engine import OrderBookReplayEngine, HistoricalDataLoader, BacktestEvent
-from .fill_simulator import FillSimulator, FillEvent
+from .fill_simulator_fifo import FIFOFillSimulator, FillEvent, TradeEvent, LOBSnapshot
 from .metrics import BacktestMetrics, PerformanceMetrics
 from src.strategy import (
     AvellanedaStoikovPricer, QuoteManager, RiskManager, RiskLimits,
@@ -71,7 +74,8 @@ class BacktestResult:
     """Complete backtesting result"""
     config: BacktestConfig
     performance: PerformanceMetrics
-    success: bool
+    metrics: Optional[BacktestMetrics] = None  # Add raw metrics for detailed analysis
+    success: bool = True
     error: Optional[str] = None
     metadata: Optional[Dict] = None
     
@@ -82,11 +86,10 @@ class StrategyBacktester:
     Handles order placement, fill simulation, and performance tracking.
     """
     
-    def __init__(self, 
+    def __init__(self,
                  config: BacktestConfig,
-                 fill_simulator: FillSimulator,
+                 fill_simulator: FIFOFillSimulator,
                  metrics: BacktestMetrics):
-        
         self.config = config
         self.fill_simulator = fill_simulator
         self.metrics = metrics
@@ -178,8 +181,15 @@ class StrategyBacktester:
             # Update pricer with inventory
             self.pricer.update_inventory(self.risk_manager.current_position)
             
-            logger.debug(f"Fill processed: {fill_event.side.value} {fill_event.fill_quantity:.4f} "
-                        f"@ {fill_event.fill_price:.2f}")
+            # Monitor for large positions (potential source of outlier trades)
+            position_abs = abs(self.risk_manager.current_position)
+            if position_abs > 0.5:  # More than 0.5 BTC is concerning for HFT MM
+                logger.warning(f"⚠️ LARGE POSITION: {self.risk_manager.current_position:.4f} BTC "
+                             f"@ ${self.current_price:.2f} | "
+                             f"Unrealized P&L: ${self.metrics._calculate_unrealized_pnl(self.current_price):.2f}")
+            
+            # logger.debug(f"Fill processed: {fill_event.side.value} {fill_event.fill_quantity:.4f} "
+            #             f"@ {fill_event.fill_price:.2f}")
             
         except Exception as e:
             logger.error(f"Error handling fill callback: {e}")
@@ -324,7 +334,7 @@ class BacktestEngine:
             print(f"Running backtest: {config.symbol} {config.start_date} to {config.end_date}")
             
             # Initialize components
-            fill_simulator = FillSimulator(
+            fill_simulator = FIFOFillSimulator(
                 maker_fee=config.maker_fee,
                 taker_fee=config.taker_fee,
                 latency_mean_ms=config.latency_mean_ms
@@ -353,6 +363,7 @@ class BacktestEngine:
                     config=config,
                     performance=PerformanceMetrics(
                         total_pnl=0, realized_pnl=0, unrealized_pnl=0, gross_pnl=0, net_pnl=0,
+                        total_return_pct=0, avg_trade_pnl=0, total_volume=0,
                         sharpe_ratio=0, sortino_ratio=0, calmar_ratio=0, max_drawdown=0,
                         max_drawdown_duration=0, volatility=0, total_trades=0, winning_trades=0,
                         losing_trades=0, win_rate=0, avg_win=0, avg_loss=0, profit_factor=0,
@@ -368,12 +379,39 @@ class BacktestEngine:
             
             # Calculate final performance
             final_price = strategy_backtester.current_price or 50000.0
+            
+            # Close any open positions at backtest end to realize P&L
+            if metrics.current_position != 0:
+                logger.info(f"Closing open position: {metrics.current_position:.4f} at final price {final_price:.2f}")
+                
+                # Create a synthetic fill to close the position
+                from .fill_simulator import FillEvent, FillReason
+                close_side = OrderSide.ASK if metrics.current_position > 0 else OrderSide.BID
+                close_qty = abs(metrics.current_position)
+                
+                close_fill = FillEvent(
+                    timestamp=time.time(),
+                    order_id="backtest_close",
+                    side=close_side,
+                    fill_quantity=close_qty,
+                    remaining_quantity=0.0,  # Full close
+                    fill_price=final_price,
+                    fee=close_qty * final_price * 0.0005,  # Taker fee for market close
+                    fill_reason=FillReason.AGGRESSIVE_FILL,  # Market order to close
+                    is_maker=False,
+                    latency_ms=0.0
+                )
+                
+                metrics.record_fill(close_fill, final_price)
+                logger.info(f"Position closed. Final P&L: {metrics.realized_pnl:.2f}")
+            
             performance = metrics.calculate_performance_metrics(final_price)
             
             # Create result
             result = BacktestResult(
                 config=config,
                 performance=performance,
+                metrics=metrics,  # Pass metrics for detailed charts
                 success=True,
                 metadata={
                     'replay_stats': replay_results.get('statistics', {}),
@@ -388,17 +426,20 @@ class BacktestEngine:
             
             self.results.append(result)
             
-            logger.success(f"Backtest completed: PnL={performance.total_pnl:.2f}, "
-                          f"Sharpe={performance.sharpe_ratio:.2f}, Trades={performance.total_trades}")
+            logger.info(f"Backtest completed: PnL={performance.total_pnl:.2f}, "
+                       f"Sharpe={performance.sharpe_ratio:.2f}, Trades={performance.total_trades}")
             
             return result
             
         except Exception as e:
             logger.error(f"Backtest failed: {e}")
+            import traceback
+            traceback.print_exc()
             return BacktestResult(
                 config=config,
                 performance=PerformanceMetrics(
                     total_pnl=0, realized_pnl=0, unrealized_pnl=0, gross_pnl=0, net_pnl=0,
+                    total_return_pct=0, avg_trade_pnl=0, total_volume=0,
                     sharpe_ratio=0, sortino_ratio=0, calmar_ratio=0, max_drawdown=0,
                     max_drawdown_duration=0, volatility=0, total_trades=0, winning_trades=0,
                     losing_trades=0, win_rate=0, avg_win=0, avg_loss=0, profit_factor=0,

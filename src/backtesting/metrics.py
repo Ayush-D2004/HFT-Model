@@ -9,12 +9,15 @@ Comprehensive metrics calculation for strategy evaluation including:
 """
 
 import time
+import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from scipy import stats
-from loguru import logger
+
+# Use standard logging instead of loguru
+logger = logging.getLogger(__name__)
 
 from .fill_simulator import FillEvent
 from src.strategy import Order, OrderSide
@@ -138,14 +141,14 @@ class BacktestMetrics:
                 position_change = -fill_event.fill_quantity
                 cash_change = fill_event.fill_quantity * fill_event.fill_price - fill_event.fee
             
-            # Calculate new average entry price
+            # Calculate new average entry price (fees tracked separately)
             if self.current_position + position_change != 0:
                 if self.current_position == 0:
                     # Opening new position
                     new_avg_price = fill_event.fill_price
                 elif (self.current_position > 0 and position_change > 0) or \
                      (self.current_position < 0 and position_change < 0):
-                    # Adding to existing position
+                    # Adding to existing position - weighted average
                     total_cost = (self.current_position * self.avg_entry_price + 
                                 position_change * fill_event.fill_price)
                     new_avg_price = total_cost / (self.current_position + position_change)
@@ -153,6 +156,7 @@ class BacktestMetrics:
                     # Reducing position - realize some PnL
                     closed_quantity = min(abs(position_change), abs(self.current_position))
                     
+                    # Calculate trade P&L (price difference only, fees tracked separately)
                     if self.current_position > 0:
                         # Closing long position
                         trade_pnl = closed_quantity * (fill_event.fill_price - self.avg_entry_price)
@@ -162,21 +166,24 @@ class BacktestMetrics:
                     
                     self.realized_pnl += trade_pnl
                     
-                    # Record completed trade
+                    # Record completed trade (fees subtracted from total P&L separately)
                     self._record_trade(fill_event, closed_quantity, trade_pnl)
                     
                     # Update average price (unchanged if reducing position)
                     new_avg_price = self.avg_entry_price
             else:
-                # Position going to zero
+                # Position going to zero (full close)
                 if self.current_position != 0:
+                    closed_quantity = abs(self.current_position)
+                    
+                    # Calculate trade P&L (price difference only)
                     if self.current_position > 0:
-                        trade_pnl = self.current_position * (fill_event.fill_price - self.avg_entry_price)
+                        trade_pnl = closed_quantity * (fill_event.fill_price - self.avg_entry_price)
                     else:
-                        trade_pnl = abs(self.current_position) * (self.avg_entry_price - fill_event.fill_price)
+                        trade_pnl = closed_quantity * (self.avg_entry_price - fill_event.fill_price)
                     
                     self.realized_pnl += trade_pnl
-                    self._record_trade(fill_event, abs(self.current_position), trade_pnl)
+                    self._record_trade(fill_event, closed_quantity, trade_pnl)
                 
                 new_avg_price = 0.0
             
@@ -275,9 +282,9 @@ class BacktestMetrics:
         try:
             # Calculate current PnL
             unrealized_pnl = self._calculate_unrealized_pnl(current_price)
-            total_pnl = self.realized_pnl + unrealized_pnl
-            gross_pnl = total_pnl + self.total_fees  # Before fees
-            net_pnl = total_pnl  # After fees
+            gross_pnl = self.realized_pnl + unrealized_pnl  # P&L from price movements only
+            net_pnl = gross_pnl - self.total_fees  # After subtracting all fees
+            total_pnl = net_pnl  # Net P&L is the final P&L
             
             # Time metrics
             if self.pnl_series:
@@ -335,6 +342,11 @@ class BacktestMetrics:
                 winning_trades = len([pnl for pnl in trade_pnls if pnl > 0])
                 losing_trades = len([pnl for pnl in trade_pnls if pnl < 0])
                 win_rate = winning_trades / total_trades
+                
+                # Debug: Log trade P&Ls to understand why win rate is 0
+                logger.info(f"Trade P&Ls sample (first 10): {trade_pnls[:10]}")
+                logger.info(f"Total trades: {total_trades}, Winning: {winning_trades}, Losing: {losing_trades}")
+                logger.info(f"Sum of trade P&Ls: {sum(trade_pnls):.2f}")
                 
                 winning_pnls = [pnl for pnl in trade_pnls if pnl > 0]
                 losing_pnls = [pnl for pnl in trade_pnls if pnl < 0]
@@ -463,6 +475,104 @@ class BacktestMetrics:
     def get_trade_history(self) -> List[Dict]:
         """Get completed trade history"""
         return self.trades.copy()
+    
+    def detect_trade_outliers(self, std_threshold: float = 3.0) -> Dict:
+        """
+        Detect statistical outliers in trade P&L using dynamic z-score method.
+        
+        GENERIC OUTLIER DETECTION:
+        - Works for any P&L distribution (BTC, ETH, stocks, etc.)
+        - Uses z-score: outliers are trades > std_threshold standard deviations from mean
+        - Returns both outlier trades and adjusted metrics excluding them
+        - Default threshold: 3.0 (captures ~99.7% of normal distribution)
+        
+        Args:
+            std_threshold: Number of standard deviations to consider outlier (default: 3.0)
+        
+        Returns:
+            Dictionary with outlier analysis:
+            - outlier_trades: List of detected outlier trades
+            - normal_trades: List of normal trades
+            - outlier_count: Number of outliers detected
+            - total_trades: Total number of trades
+            - outlier_pct: Percentage of outliers
+            - mean_normal: Average P&L of normal trades
+            - mean_with_outliers: Average P&L including outliers
+            - total_outlier_impact: Total P&L from outliers
+        """
+        if len(self.trades) < 3:
+            # Need minimum 3 trades for meaningful statistics
+            return {
+                'outlier_trades': [],
+                'normal_trades': self.trades.copy(),
+                'outlier_count': 0,
+                'total_trades': len(self.trades),
+                'outlier_pct': 0.0,
+                'mean_normal': np.mean([t['pnl'] for t in self.trades]) if self.trades else 0.0,
+                'mean_with_outliers': np.mean([t['pnl'] for t in self.trades]) if self.trades else 0.0,
+                'total_outlier_impact': 0.0
+            }
+        
+        # Extract trade P&Ls
+        trade_pnls = np.array([trade['pnl'] for trade in self.trades])
+        
+        # Calculate z-scores (number of std deviations from mean)
+        mean_pnl = np.mean(trade_pnls)
+        std_pnl = np.std(trade_pnls)
+        
+        if std_pnl < 1e-9:
+            # All trades have same P&L (no variation) - no outliers
+            return {
+                'outlier_trades': [],
+                'normal_trades': self.trades.copy(),
+                'outlier_count': 0,
+                'total_trades': len(self.trades),
+                'outlier_pct': 0.0,
+                'mean_normal': mean_pnl,
+                'mean_with_outliers': mean_pnl,
+                'total_outlier_impact': 0.0
+            }
+        
+        z_scores = np.abs((trade_pnls - mean_pnl) / std_pnl)
+        
+        # Identify outliers
+        outlier_mask = z_scores > std_threshold
+        outlier_indices = np.where(outlier_mask)[0]
+        normal_indices = np.where(~outlier_mask)[0]
+        
+        outlier_trades = [self.trades[i] for i in outlier_indices]
+        normal_trades = [self.trades[i] for i in normal_indices]
+        
+        # Calculate statistics
+        normal_pnls = trade_pnls[normal_indices]
+        mean_normal = np.mean(normal_pnls) if len(normal_pnls) > 0 else 0.0
+        total_outlier_impact = np.sum(trade_pnls[outlier_indices])
+        
+        outlier_pct = (len(outlier_trades) / len(self.trades)) * 100
+        
+        # Log detected outliers
+        if len(outlier_trades) > 0:
+            logger.info(f"🔍 Detected {len(outlier_trades)} outlier trades ({outlier_pct:.1f}% of total):")
+            for i, trade in enumerate(outlier_trades):
+                z_score = z_scores[outlier_indices[i]]
+                logger.info(f"  Outlier #{i+1}: P&L=${trade['pnl']:.2f}, "
+                          f"z-score={z_score:.2f}, timestamp={trade['timestamp']}")
+            logger.info(f"  Impact: Total outlier P&L = ${total_outlier_impact:.2f}")
+            logger.info(f"  Avg P&L: ${mean_pnl:.2f} (with outliers) "
+                       f"→ ${mean_normal:.2f} (without outliers)")
+        
+        return {
+            'outlier_trades': outlier_trades,
+            'normal_trades': normal_trades,
+            'outlier_count': len(outlier_trades),
+            'total_trades': len(self.trades),
+            'outlier_pct': outlier_pct,
+            'mean_normal': mean_normal,
+            'mean_with_outliers': mean_pnl,
+            'total_outlier_impact': total_outlier_impact,
+            'std_pnl': std_pnl,
+            'z_threshold': std_threshold
+        }
     
     def get_daily_pnl(self) -> Dict[str, float]:
         """Calculate daily PnL breakdown"""
