@@ -337,7 +337,10 @@ class OrderBookReplayEngine:
             if midprice is None:
                 return
             
-            # Create market update event
+            # ✅ SIMPLIFIED: Send single market update per candle
+            # Sub-tick generation was causing 518k callbacks → too slow + log spam
+            # Instead: let strategy decide quote update frequency via _should_update_quotes()
+            
             market_event = BacktestEvent(
                 timestamp=self.current_time,
                 event_type='market_update',

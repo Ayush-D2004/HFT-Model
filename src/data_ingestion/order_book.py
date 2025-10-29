@@ -193,7 +193,10 @@ class OrderBook:
             return False
     
     def _validate_sequence(self, first_id: int, final_id: int) -> bool:
-        """Validate update sequence according to Binance rules"""
+        """
+        ✅ ISSUE #2 FIX: Validate update sequence according to Binance rules
+        Always log warnings for gaps, even in non-strict mode
+        """
         expected_next = self.last_update_id + 1
         
         # Check if this is the expected next update
@@ -202,14 +205,20 @@ class OrderBook:
         
         # Check for gap (missing updates)
         if first_id > expected_next:
+            gap_size = first_id - expected_next
+            # ✅ FIX: Always log warning about gaps (even in non-strict mode)
+            logger.warning(f"Sequence gap detected: expected {expected_next}, got {first_id} "
+                         f"(missing {gap_size} updates)")
+            self.stats['out_of_sequence'] += 1
+            
             if self.strict_sequencing:
-                logger.warning(f"Sequence gap detected: expected {expected_next}, got {first_id}")
-                self.stats['out_of_sequence'] += 1
+                # In strict mode, reject the update (live trading)
+                logger.error(f"STRICT MODE: Rejecting update due to gap")
                 return False
             else:
-                # In non-strict mode (backtesting), silently accept gaps
-                self.stats['out_of_sequence'] += 1
-                return True  # Allow the update to continue
+                # In non-strict mode, accept but log (backtesting)
+                logger.info(f"NON-STRICT MODE: Accepting update despite gap (backtesting)")
+                return True
         
         # Check for duplicate/old update
         if final_id <= self.last_update_id:

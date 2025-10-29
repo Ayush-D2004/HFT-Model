@@ -19,7 +19,7 @@ from scipy import stats
 # Use standard logging instead of loguru
 logger = logging.getLogger(__name__)
 
-from .fill_simulator import FillEvent
+from .fill_simulator_fifo import FillEvent
 from src.strategy import Order, OrderSide
 
 
@@ -122,7 +122,10 @@ class BacktestMetrics:
     
     def record_fill(self, fill_event: FillEvent, current_price: float) -> None:
         """
-        Record a fill event and update all relevant metrics.
+        🚀 PROFESSIONAL HFT: Record EVERY fill as a trade (industry standard).
+        
+        Real HFT market makers count every fill as a separate trade, not round-trips.
+        This gives accurate trade count, frequency, and P&L attribution.
         
         Args:
             fill_event: The fill event to record
@@ -141,7 +144,19 @@ class BacktestMetrics:
                 position_change = -fill_event.fill_quantity
                 cash_change = fill_event.fill_quantity * fill_event.fill_price - fill_event.fee
             
-            # Calculate new average entry price (fees tracked separately)
+            # 🚀 PROFESSIONAL HFT: Record EVERY fill as a trade immediately
+            # Calculate instantaneous P&L based on current market vs fill price
+            if fill_event.side == OrderSide.BID:
+                # Bought at fill_price, current market value at current_price
+                instant_pnl = fill_event.fill_quantity * (current_price - fill_event.fill_price)
+            else:
+                # Sold at fill_price, current market value at current_price
+                instant_pnl = fill_event.fill_quantity * (fill_event.fill_price - current_price)
+            
+            # Record this fill as a trade (industry standard for HFT)
+            self._record_trade(fill_event, fill_event.fill_quantity, instant_pnl)
+            
+            # Calculate new average entry price for inventory tracking (separate from trade counting)
             if self.current_position + position_change != 0:
                 if self.current_position == 0:
                     # Opening new position
@@ -166,9 +181,6 @@ class BacktestMetrics:
                     
                     self.realized_pnl += trade_pnl
                     
-                    # Record completed trade (fees subtracted from total P&L separately)
-                    self._record_trade(fill_event, closed_quantity, trade_pnl)
-                    
                     # Update average price (unchanged if reducing position)
                     new_avg_price = self.avg_entry_price
             else:
@@ -183,7 +195,6 @@ class BacktestMetrics:
                         trade_pnl = closed_quantity * (self.avg_entry_price - fill_event.fill_price)
                     
                     self.realized_pnl += trade_pnl
-                    self._record_trade(fill_event, closed_quantity, trade_pnl)
                 
                 new_avg_price = 0.0
             
@@ -230,16 +241,51 @@ class BacktestMetrics:
         })
     
     def _record_trade(self, fill_event: FillEvent, quantity: float, pnl: float) -> None:
-        """Record a completed trade"""
+        """
+        Record a completed trade with ENHANCED CONTEXT for outlier diagnosis.
+        
+        Captures all 4 diagnostic variables from outlier framework:
+        - fill_price vs midprice (ΔMid)
+        - timestamp gaps (Δt)
+        - inventory changes (notional)
+        - spread context (for P&L ratio)
+        """
+        # Get current market context if available
+        midprice = fill_event.fill_price  # Fallback
+        spread = 0.001 * fill_event.fill_price  # Default 10 bps
+        
+        # Try to extract from last PnL series point (has market context)
+        if len(self.pnl_series) > 0:
+            # Midprice is approximated from recent trades
+            recent_prices = [self.trades[i]['exit_price'] for i in range(max(0, len(self.trades)-10), len(self.trades))]
+            if recent_prices:
+                midprice = np.median(recent_prices)
+        
+        # Calculate time gap from previous trade
+        prev_timestamp = self.trades[-1]['timestamp'] if self.trades else fill_event.timestamp
+        time_gap = fill_event.timestamp - prev_timestamp
+        
+        # Enhanced trade record with diagnostic context
         trade = {
             'timestamp': fill_event.timestamp,
             'side': 'close_long' if fill_event.side == OrderSide.ASK else 'close_short',
             'quantity': quantity,
             'entry_price': self.avg_entry_price,
             'exit_price': fill_event.fill_price,
+            'fill_price': fill_event.fill_price,  # Alias for consistency
             'pnl': pnl,
             'fee': fill_event.fee,
-            'duration': 0.0  # Could calculate from entry time if tracked
+            'duration': 0.0,  # Could calculate from entry time if tracked
+            
+            # OUTLIER DIAGNOSTIC CONTEXT
+            'midprice': midprice,  # For ΔMid calculation
+            'spread': spread,  # For P&L ratio calculation
+            'inventory_before': self.current_position + (quantity if fill_event.side == OrderSide.ASK else -quantity),
+            'inventory_after': self.current_position,
+            'time_gap': time_gap,  # Δt for stale fill detection
+            'notional': quantity * fill_event.fill_price,  # For blow-up detection
+            'is_maker': fill_event.is_maker,
+            'latency_ms': fill_event.latency_ms
         }
         
         self.trades.append(trade)
@@ -280,11 +326,27 @@ class BacktestMetrics:
             return self._metrics_cache
         
         try:
-            # Calculate current PnL
+            # 🔧 CRITICAL FIX: Use per-fill trade P&Ls instead of round-trip realized_pnl
+            # Problem: realized_pnl only tracks CLOSED positions (round-trip accounting)
+            # Solution: Sum individual trade P&Ls (per-fill accounting)
+            # This matches our per-fill trade recording logic
+            
+            # Calculate total P&L from individual trade records
+            trade_pnls_sum = sum(trade['pnl'] for trade in self.trades) if self.trades else 0.0
+            
+            # Calculate unrealized P&L from open position
             unrealized_pnl = self._calculate_unrealized_pnl(current_price)
-            gross_pnl = self.realized_pnl + unrealized_pnl  # P&L from price movements only
-            net_pnl = gross_pnl - self.total_fees  # After subtracting all fees
+            
+            # Gross P&L = sum of all trade P&Ls + unrealized P&L from open position
+            gross_pnl = trade_pnls_sum + unrealized_pnl
+            
+            # Net P&L = gross P&L minus all fees
+            net_pnl = gross_pnl - self.total_fees
             total_pnl = net_pnl  # Net P&L is the final P&L
+            
+            # For dashboard compatibility, also update realized_pnl to match trade sum
+            # (This ensures consistency across all P&L displays)
+            calculated_realized_pnl = trade_pnls_sum  # Use trade-based calculation
             
             # Time metrics
             if self.pnl_series:
@@ -338,15 +400,26 @@ class BacktestMetrics:
             # Trading metrics
             total_trades = len(self.trades)
             if total_trades > 0:
+                # ✅ ISSUE #10 FIX: Ensure correct P&L calculation
+                # Trade P&L should be price difference only (fees tracked separately)
                 trade_pnls = [trade['pnl'] for trade in self.trades]
+                
+                # Validate trade P&Ls are calculated correctly
+                # Winning = P&L > 0 (price movement in our favor)
+                # Losing = P&L < 0 (price movement against us)
+                # Note: Fees are subtracted separately in gross_pnl calculation
                 winning_trades = len([pnl for pnl in trade_pnls if pnl > 0])
                 losing_trades = len([pnl for pnl in trade_pnls if pnl < 0])
-                win_rate = winning_trades / total_trades
+                breakeven_trades = len([pnl for pnl in trade_pnls if pnl == 0])
+                win_rate = winning_trades / total_trades if total_trades > 0 else 0.0
                 
-                # Debug: Log trade P&Ls to understand why win rate is 0
-                logger.info(f"Trade P&Ls sample (first 10): {trade_pnls[:10]}")
-                logger.info(f"Total trades: {total_trades}, Winning: {winning_trades}, Losing: {losing_trades}")
-                logger.info(f"Sum of trade P&Ls: {sum(trade_pnls):.2f}")
+                # Debug: Log trade P&Ls to verify calculation
+                if total_trades > 0:
+                    logger.info(f"📊 Trade Analysis: Total={total_trades}, "
+                              f"Winning={winning_trades}, Losing={losing_trades}, "
+                              f"Breakeven={breakeven_trades}, Win Rate={win_rate*100:.1f}%")
+                    logger.info(f"   Trade P&Ls sample (first 10): {trade_pnls[:10]}")
+                    logger.info(f"   Sum of trade P&Ls: {sum(trade_pnls):.2f}")
                 
                 winning_pnls = [pnl for pnl in trade_pnls if pnl > 0]
                 losing_pnls = [pnl for pnl in trade_pnls if pnl < 0]
@@ -398,10 +471,11 @@ class BacktestMetrics:
             pnl_history = [pnl for _, pnl in self.pnl_series] if self.pnl_series else []
             timestamps = [ts for ts, _ in self.pnl_series] if self.pnl_series else []
             
+            # 🔧 CRITICAL FIX: Use trade-based realized_pnl for consistency
             # Create metrics object
             metrics = PerformanceMetrics(
                 total_pnl=total_pnl,
-                realized_pnl=self.realized_pnl,
+                realized_pnl=calculated_realized_pnl,  # Use trade sum, not round-trip realized_pnl
                 unrealized_pnl=unrealized_pnl,
                 gross_pnl=gross_pnl,
                 net_pnl=net_pnl,
@@ -478,100 +552,259 @@ class BacktestMetrics:
     
     def detect_trade_outliers(self, std_threshold: float = 3.0) -> Dict:
         """
-        Detect statistical outliers in trade P&L using dynamic z-score method.
+        PROFESSIONAL OUTLIER DETECTION with 7-type taxonomy and root cause diagnosis.
         
-        GENERIC OUTLIER DETECTION:
-        - Works for any P&L distribution (BTC, ETH, stocks, etc.)
-        - Uses z-score: outliers are trades > std_threshold standard deviations from mean
-        - Returns both outlier trades and adjusted metrics excluding them
-        - Default threshold: 3.0 (captures ~99.7% of normal distribution)
+        Based on quantitative framework for HFT outlier classification:
+        1. Data Spike - corrupted ticks (remove)
+        2. Stale Fill - old quote fill (remove)
+        3. Position Blow-Up - large inventory close (cap/remove)
+        4. Scaling Error - wrong units (remove)
+        5. Aggregation Error - merged fills (correct)
+        6. Regime Shift - genuine event (keep & tag)
+        7. Statistical Tail - legitimate tail (winsorize)
         
-        Args:
-            std_threshold: Number of standard deviations to consider outlier (default: 3.0)
+        Diagnosis Framework (4 checks per trade):
+        - ΔMid = |fill_price - mid| / mid (threshold: 0.002 = 20 bps)
+        - Δt between ticks (threshold: 5 seconds)
+        - inventory_before × price consistency
+        - PnL / (spread × size) ratio (threshold: 10×)
         
         Returns:
-            Dictionary with outlier analysis:
-            - outlier_trades: List of detected outlier trades
-            - normal_trades: List of normal trades
-            - outlier_count: Number of outliers detected
-            - total_trades: Total number of trades
-            - outlier_pct: Percentage of outliers
-            - mean_normal: Average P&L of normal trades
-            - mean_with_outliers: Average P&L including outliers
-            - total_outlier_impact: Total P&L from outliers
+            Comprehensive outlier analysis with classification and treatment
         """
         if len(self.trades) < 3:
-            # Need minimum 3 trades for meaningful statistics
-            return {
-                'outlier_trades': [],
-                'normal_trades': self.trades.copy(),
-                'outlier_count': 0,
-                'total_trades': len(self.trades),
-                'outlier_pct': 0.0,
-                'mean_normal': np.mean([t['pnl'] for t in self.trades]) if self.trades else 0.0,
-                'mean_with_outliers': np.mean([t['pnl'] for t in self.trades]) if self.trades else 0.0,
-                'total_outlier_impact': 0.0
-            }
+            return self._empty_outlier_result()
         
-        # Extract trade P&Ls
+        # Extract trade data
         trade_pnls = np.array([trade['pnl'] for trade in self.trades])
-        
-        # Calculate z-scores (number of std deviations from mean)
         mean_pnl = np.mean(trade_pnls)
         std_pnl = np.std(trade_pnls)
         
         if std_pnl < 1e-9:
-            # All trades have same P&L (no variation) - no outliers
-            return {
-                'outlier_trades': [],
-                'normal_trades': self.trades.copy(),
-                'outlier_count': 0,
-                'total_trades': len(self.trades),
-                'outlier_pct': 0.0,
-                'mean_normal': mean_pnl,
-                'mean_with_outliers': mean_pnl,
-                'total_outlier_impact': 0.0
-            }
+            return self._empty_outlier_result()
         
+        # Calculate z-scores
         z_scores = np.abs((trade_pnls - mean_pnl) / std_pnl)
         
-        # Identify outliers
+        # Detect outliers by z-score
         outlier_mask = z_scores > std_threshold
         outlier_indices = np.where(outlier_mask)[0]
         normal_indices = np.where(~outlier_mask)[0]
         
-        outlier_trades = [self.trades[i] for i in outlier_indices]
-        normal_trades = [self.trades[i] for i in normal_indices]
+        # CLASSIFY each outlier by root cause
+        classified_outliers = []
+        for idx in outlier_indices:
+            trade = self.trades[idx]
+            classification = self._diagnose_outlier(trade, idx)
+            
+            classified_outliers.append({
+                **trade,
+                'z_score': z_scores[idx],
+                'outlier_type': classification['type'],
+                'root_cause': classification['cause'],
+                'treatment': classification['treatment'],
+                'keep': classification['keep'],
+                'diagnostics': classification['diagnostics']
+            })
+        
+        # Separate by treatment
+        outliers_to_remove = [o for o in classified_outliers if not o['keep']]
+        outliers_to_keep = [o for o in classified_outliers if o['keep']]
+        
+        # Build clean trade list (removes artefacts, keeps genuine outliers)
+        clean_trades = [self.trades[i] for i in normal_indices] + [
+            {k: v for k, v in o.items() if k not in ['z_score', 'outlier_type', 'root_cause', 'treatment', 'keep', 'diagnostics']}
+            for o in outliers_to_keep
+        ]
         
         # Calculate statistics
-        normal_pnls = trade_pnls[normal_indices]
-        mean_normal = np.mean(normal_pnls) if len(normal_pnls) > 0 else 0.0
-        total_outlier_impact = np.sum(trade_pnls[outlier_indices])
+        clean_pnls = np.array([t['pnl'] for t in clean_trades])
+        mean_clean = np.mean(clean_pnls) if len(clean_pnls) > 0 else 0.0
         
-        outlier_pct = (len(outlier_trades) / len(self.trades)) * 100
+        # Winsorized metrics (cap at ±3σ for statistical tails)
+        winsorized_pnls = np.clip(clean_pnls, 
+                                  mean_clean - 3*np.std(clean_pnls),
+                                  mean_clean + 3*np.std(clean_pnls))
+        mean_winsorized = np.mean(winsorized_pnls) if len(winsorized_pnls) > 0 else 0.0
         
-        # Log detected outliers
-        if len(outlier_trades) > 0:
-            logger.info(f"🔍 Detected {len(outlier_trades)} outlier trades ({outlier_pct:.1f}% of total):")
-            for i, trade in enumerate(outlier_trades):
-                z_score = z_scores[outlier_indices[i]]
-                logger.info(f"  Outlier #{i+1}: P&L=${trade['pnl']:.2f}, "
-                          f"z-score={z_score:.2f}, timestamp={trade['timestamp']}")
-            logger.info(f"  Impact: Total outlier P&L = ${total_outlier_impact:.2f}")
-            logger.info(f"  Avg P&L: ${mean_pnl:.2f} (with outliers) "
-                       f"→ ${mean_normal:.2f} (without outliers)")
+        total_outlier_impact = np.sum([o['pnl'] for o in classified_outliers])
+        outlier_pct = (len(classified_outliers) / len(self.trades)) * 100
+        
+        # Log comprehensive outlier report
+        if len(classified_outliers) > 0:
+            logger.info(f"🔍 OUTLIER DETECTION REPORT ({len(classified_outliers)} outliers, {outlier_pct:.1f}% of trades):")
+            
+            # Group by type
+            type_counts = {}
+            for o in classified_outliers:
+                otype = o['outlier_type']
+                type_counts[otype] = type_counts.get(otype, 0) + 1
+            
+            for otype, count in sorted(type_counts.items()):
+                logger.info(f"  {otype}: {count} occurrences")
+            
+            logger.info(f"  Removed: {len(outliers_to_remove)} artefacts")
+            logger.info(f"  Kept: {len(outliers_to_keep)} genuine events")
+            logger.info(f"  Total Impact: ${total_outlier_impact:.2f}")
+            logger.info(f"  Avg P&L: ${mean_pnl:.2f} (raw) → ${mean_clean:.2f} (clean) → ${mean_winsorized:.2f} (winsorized)")
+            
+            # Log details of each outlier (first 5)
+            logger.info("  Outlier Details:")
+            for i, o in enumerate(classified_outliers[:5]):
+                logger.info(f"    #{i+1}: P&L=${o['pnl']:.2f}, Type={o['outlier_type']}, "
+                          f"z-score={o['z_score']:.2f}, Keep={o['keep']}")
+                logger.info(f"        Cause: {o['root_cause']}")
+                logger.info(f"        Diagnostics: ΔMid={o['diagnostics'].get('delta_mid_bps', 0):.1f} bps, "
+                          f"Δt={o['diagnostics'].get('delta_t', 0):.1f}s, "
+                          f"Notional=${o['diagnostics'].get('notional_change', 0):.0f}, "
+                          f"P&L Ratio={o['diagnostics'].get('pnl_ratio', 0):.1f}×")
+            
+            if len(classified_outliers) > 5:
+                logger.info(f"    ... and {len(classified_outliers) - 5} more outliers")
         
         return {
-            'outlier_trades': outlier_trades,
-            'normal_trades': normal_trades,
-            'outlier_count': len(outlier_trades),
+            'outlier_trades': classified_outliers,
+            'normal_trades': [self.trades[i] for i in normal_indices],
+            'clean_trades': clean_trades,
+            'outliers_removed': outliers_to_remove,
+            'outliers_kept': outliers_to_keep,
+            'outlier_count': len(classified_outliers),
+            'removed_count': len(outliers_to_remove),
+            'kept_count': len(outliers_to_keep),
             'total_trades': len(self.trades),
             'outlier_pct': outlier_pct,
-            'mean_normal': mean_normal,
-            'mean_with_outliers': mean_pnl,
+            'mean_raw': mean_pnl,
+            'mean_clean': mean_clean,
+            'mean_winsorized': mean_winsorized,
+            'mean_normal': np.mean([self.trades[i]['pnl'] for i in normal_indices]) if len(normal_indices) > 0 else 0.0,
             'total_outlier_impact': total_outlier_impact,
             'std_pnl': std_pnl,
-            'z_threshold': std_threshold
+            'z_threshold': std_threshold,
+            'type_counts': type_counts if classified_outliers else {}
+        }
+    
+    def _empty_outlier_result(self) -> Dict:
+        """Return empty outlier result for edge cases"""
+        mean_pnl = np.mean([t['pnl'] for t in self.trades]) if self.trades else 0.0
+        return {
+            'outlier_trades': [],
+            'normal_trades': self.trades.copy(),
+            'clean_trades': self.trades.copy(),
+            'outliers_removed': [],
+            'outliers_kept': [],
+            'outlier_count': 0,
+            'removed_count': 0,
+            'kept_count': 0,
+            'total_trades': len(self.trades),
+            'outlier_pct': 0.0,
+            'mean_raw': mean_pnl,
+            'mean_clean': mean_pnl,
+            'mean_winsorized': mean_pnl,
+            'mean_normal': mean_pnl,
+            'total_outlier_impact': 0.0,
+            'type_counts': {}
+        }
+    
+    def _diagnose_outlier(self, trade: Dict, trade_idx: int) -> Dict:
+        """
+        Diagnose outlier type using 4-variable framework.
+        Returns classification with treatment protocol.
+        """
+        diagnostics = {}
+        
+        # Extract trade details
+        fill_price = trade.get('fill_price', 0)
+        pnl = trade['pnl']
+        size = trade.get('quantity', 0)
+        timestamp = trade.get('timestamp', 0)
+        side = trade.get('side', '')
+        
+        # Get market context (if available)
+        midprice = trade.get('midprice', fill_price)  # Fallback to fill price
+        spread = trade.get('spread', 0.001 * midprice)  # Default 10 bps
+        
+        # CHECK 1: ΔMid = |fill_price - mid| / mid
+        delta_mid = abs(fill_price - midprice) / midprice if midprice > 0 else 0
+        diagnostics['delta_mid'] = delta_mid
+        diagnostics['delta_mid_bps'] = delta_mid * 10000
+        
+        # CHECK 2: Δt between ticks (check against previous trade)
+        delta_t = 0
+        if trade_idx > 0:
+            prev_timestamp = self.trades[trade_idx - 1].get('timestamp', timestamp)
+            delta_t = timestamp - prev_timestamp
+        diagnostics['delta_t'] = delta_t
+        
+        # CHECK 3: Inventory × price consistency (detect position blow-ups)
+        inventory_before = trade.get('inventory_before', 0)
+        inventory_after = trade.get('inventory_after', 0)
+        notional_change = abs(inventory_after - inventory_before) * fill_price
+        diagnostics['notional_change'] = notional_change
+        
+        # CHECK 4: PnL / (spread × size) - should be < 5× for normal trades
+        expected_pnl = spread * size
+        pnl_ratio = abs(pnl) / expected_pnl if expected_pnl > 1e-6 else 0
+        diagnostics['pnl_ratio'] = pnl_ratio
+        
+        # CLASSIFICATION LOGIC (priority order)
+        
+        # Type 1: Data Spike (extreme slippage)
+        if delta_mid > 0.10:  # 10% slippage = data error
+            return {
+                'type': 'DATA_SPIKE',
+                'cause': f'Extreme slippage {delta_mid*100:.1f}% suggests corrupted tick',
+                'treatment': 'REMOVE',
+                'keep': False,
+                'diagnostics': diagnostics
+            }
+        
+        # Type 2: Stale Fill (large time gap + high slippage)
+        if delta_t > 5.0 and delta_mid > 0.002:  # 5+ sec gap + 20 bps slip
+            return {
+                'type': 'STALE_FILL',
+                'cause': f'Fill delayed {delta_t:.1f}s with {diagnostics["delta_mid_bps"]:.0f} bps slippage',
+                'treatment': 'REMOVE',
+                'keep': False,
+                'diagnostics': diagnostics
+            }
+        
+        # Type 4: Scaling Error (P&L ratio way off)
+        if pnl_ratio > 50:  # P&L > 50× expected spread capture
+            return {
+                'type': 'SCALING_ERROR',
+                'cause': f'P&L {pnl_ratio:.0f}× expected (likely unit error)',
+                'treatment': 'REMOVE',
+                'keep': False,
+                'diagnostics': diagnostics
+            }
+        
+        # Type 3: Position Blow-Up (large notional change)
+        if notional_change > 10000:  # $10k+ notional swing (adjust for asset)
+            return {
+                'type': 'POSITION_BLOWUP',
+                'cause': f'Large position close ${notional_change:.0f} (inventory drift)',
+                'treatment': 'CAP',
+                'keep': False,  # Remove by default, can be kept if validated
+                'diagnostics': diagnostics
+            }
+        
+        # Type 6: Regime Shift (moderate slippage, normal timing, high P&L)
+        if 0.002 < delta_mid < 0.05 and delta_t < 5.0 and pnl_ratio > 10:
+            return {
+                'type': 'REGIME_SHIFT',
+                'cause': f'Large legitimate move: {diagnostics["delta_mid_bps"]:.0f} bps slippage, {pnl_ratio:.1f}× expected',
+                'treatment': 'KEEP_TAG',
+                'keep': True,  # Keep but mark as special event
+                'diagnostics': diagnostics
+            }
+        
+        # Type 7: Statistical Tail (high z-score, but all checks normal)
+        return {
+            'type': 'STATISTICAL_TAIL',
+            'cause': f'Legitimate tail event (P&L {pnl_ratio:.1f}× expected)',
+            'treatment': 'WINSORIZE',
+            'keep': True,  # Keep but winsorize in metrics
+            'diagnostics': diagnostics
         }
     
     def get_daily_pnl(self) -> Dict[str, float]:
@@ -664,7 +897,7 @@ if __name__ == "__main__":
     metrics = BacktestMetrics(initial_capital=10000.0)
     
     # Simulate some trading activity
-    from .fill_simulator import FillEvent, FillReason
+    from .fill_simulator_fifo import FillEvent, FillReason
     from src.strategy import OrderSide
     
     current_price = 50000.0

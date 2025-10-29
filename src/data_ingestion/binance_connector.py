@@ -245,11 +245,12 @@ class BinanceConnector:
                 'trade_id': data.get('t', 0)
             }
             
-            # Register trade with order book for arrival rate estimation
-            timestamp = trade_info['timestamp'] / 1000.0  # Convert to seconds
-            self.order_book.register_trade_event(timestamp)
+            # ✅ ISSUE #3 FIX: Register trade with order book for arrival rate estimation
+            # Pass the timestamp to the strategy properly
+            timestamp_seconds = trade_info['timestamp'] / 1000.0  # Convert to seconds
+            self.order_book.register_trade_event(timestamp_seconds)
             
-            logger.debug(f"Trade: {trade_info['price']} @ {trade_info['quantity']}")
+            logger.debug(f"Trade: {trade_info['price']} @ {trade_info['quantity']} at {timestamp_seconds}")
             
         except Exception as e:
             logger.error(f"Error handling trade update: {e}")

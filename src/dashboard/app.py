@@ -338,7 +338,7 @@ def display_backtest_results(results):
             with col3:
                 st.metric("Max Drawdown", f"{perf.max_drawdown * 100:.2f}%")
             with col4:
-                st.metric("Total Trades", perf.total_trades)
+                st.metric("Filled Trades", perf.total_trades)
         else:
             # Dictionary format (fallback)
             with col1:
@@ -348,7 +348,7 @@ def display_backtest_results(results):
             with col3:
                 st.metric("Max Drawdown", f"{results.get('max_drawdown', 0) * 100:.2f}%")
             with col4:
-                st.metric("Total Trades", results.get('total_trades', 0))
+                st.metric("Filled Trades", results.get('total_trades', 0))
         
         # P&L Chart
         pnl_history = None
@@ -374,14 +374,23 @@ def display_backtest_results(results):
                 line=dict(color='green', width=2)
             ))
             
+            # Add zero line for reference
+            fig_pnl.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            
             fig_pnl.update_layout(
-                title="Cumulative P&L",
+                title="Cumulative P&L (Realized + Unrealized)",
                 xaxis_title="Time",
                 yaxis_title="P&L ($)",
                 height=400
             )
             
             st.plotly_chart(fig_pnl, use_container_width=True)
+            
+            # Explain P&L calculation
+            st.caption("💡 **P&L Chart Explanation:** This shows total P&L including unrealized gains/losses "
+                      "from open positions. The final value may differ from intermediate peaks due to "
+                      "closing positions at different prices. Large open positions can cause unrealized "
+                      "losses that offset earlier gains.")
         else:
             st.info("No P&L history data available for charting")
         
@@ -585,16 +594,47 @@ def display_backtest_results(results):
                 
                 with col1:
                     st.markdown("**📈 P&L Analysis**")
-                    realized_pnl = sum(trade_pnls)
-                    total_pnl = getattr(perf, 'total_pnl', 0)
-                    unrealized_pnl = total_pnl - realized_pnl
                     
-                    st.write(f"Realized P&L: ${realized_pnl:.2f}")
+                    # 🔧 CRITICAL FIX: perf.realized_pnl is GROSS (before fees)!
+                    # Dashboard was showing gross as "net", causing confusion
+                    realized_pnl_gross = getattr(perf, 'realized_pnl', sum(trade_pnls))  # Gross from positions
+                    total_fees = getattr(perf, 'total_fees', 0)
+                    realized_pnl_net = realized_pnl_gross - total_fees  # Subtract fees for NET
+                    
+                    total_pnl = getattr(perf, 'total_pnl', 0)  # Already net (includes fees)
+                    
+                    # Unrealized P&L = Total P&L - Realized P&L (both net of fees)
+                    unrealized_pnl = total_pnl - realized_pnl_net
+                    
+                    st.write(f"Realized P&L (Gross): ${realized_pnl_gross:.2f}")
+                    st.write(f"Total Fees: ${total_fees:.2f}")
+                    st.write(f"Realized P&L (Net): ${realized_pnl_net:.2f}")
                     st.write(f"Unrealized P&L: ${unrealized_pnl:.2f}")
                     st.write(f"Total P&L: ${total_pnl:.2f}")
                     
-                    if abs(unrealized_pnl) > abs(realized_pnl):
+                    # ✅ NEW: Show if position was excluded from P&L calculation
+                    if hasattr(results, 'metrics') and results.metrics:
+                        position_series = results.metrics.position_series
+                        if position_series and len(position_series) > 0:
+                            final_position_from_series = position_series[-1][1]
+                            # If final position in series is non-zero but unrealized_pnl is 0,
+                            # it means we excluded it from final P&L
+                            if abs(final_position_from_series) > 0.001 and abs(unrealized_pnl) < 0.01:
+                                st.success(f"✅ Open position ({final_position_from_series:.4f} BTC) excluded from final P&L")
+                                st.caption("💡 Incomplete positions don't count - final P&L only includes completed trades")
+                    
+                    # Warning for large unrealized P&L (shouldn't happen if we exclude properly)
+                    if abs(unrealized_pnl) > abs(realized_pnl_net) and abs(unrealized_pnl) > 1.0:
                         st.warning(f"⚠️ Large open position! Unrealized P&L (${unrealized_pnl:.2f}) > Realized P&L")
+                        st.caption("💡 The P&L graph may show positive values earlier, but final return includes "
+                                  "unrealized loss from the large open position at the end.")
+                    
+                    # Highlight if total P&L is negative despite positive realized
+                    if total_pnl < 0 and realized_pnl_net > 0:
+                        st.error(f"⚠️ **Negative final return despite positive realized P&L!** "
+                               f"Large unrealized loss (${unrealized_pnl:.2f}) from open position.")
+                    elif total_pnl > 0 and realized_pnl_net < 0:
+                        st.info(f"ℹ️ Positive total P&L due to unrealized gains (${unrealized_pnl:.2f})")
                     
                 with col2:
                     st.markdown("**🎯 Trade Quality**")
@@ -614,7 +654,26 @@ def display_backtest_results(results):
                 
                 with col3:
                     st.markdown("**⚖️ Market Making Health**")
-                    fill_rate = getattr(perf, 'fill_rate', 0)
+                    
+                    
+                    total_trades = getattr(perf, 'total_trades', 0)
+                    fill_rate_from_metadata = 0.0  # Default
+                    quotes_submitted = 0
+                    quotes_filled = 0
+                    total_fills = 0
+                    
+                    if hasattr(results, 'metadata') and results.metadata:
+                        fill_stats = results.metadata.get('fill_stats', {})
+                        quotes_submitted = fill_stats.get('quotes_submitted', 0)
+                        quotes_filled = fill_stats.get('quotes_filled', 0)
+                        total_fills = fill_stats.get('orders_filled', 0)  # Individual fill events
+                        
+                        # Correct fill rate calculation
+                        if quotes_submitted > 0:
+                            fill_rate_from_metadata = quotes_filled / quotes_submitted
+                    
+                    # Use the correct fill rate
+                    fill_rate = fill_rate_from_metadata
                     
                     if position_series:
                         final_position = position_series[-1][1] if position_series else 0
@@ -626,6 +685,13 @@ def display_backtest_results(results):
                             st.success("✅ Near-flat position")
                     
                     st.write(f"Fill Rate: {fill_rate:.1%}")
+                    
+                    # Show quote statistics
+                    if quotes_submitted > 0:
+                        # ✅ FIXED: Use total_fills (individual fill events), not total_trades (completed round-trips)
+                        st.caption(f"📊 {quotes_filled} of {quotes_submitted} quotes filled ({total_fills} total fills)")
+                    
+                    # ✅ FIXED: Use correct fill_rate for threshold warnings
                     if fill_rate < 0.3:
                         st.error("❌ Fill rate too low (<30%)")
                     elif fill_rate < 0.5:
@@ -638,6 +704,29 @@ def display_backtest_results(results):
         # Debug: Show raw trade data + outlier detection
         if hasattr(results, 'metrics') and hasattr(results.metrics, 'trades'):
             with st.expander("🔍 Debug: Trade P&L Data & Outlier Detection", expanded=False):
+                # Explain data points vs quote opportunities
+                if hasattr(results, 'metadata') and results.metadata:
+                    st.markdown("### 📊 Data Flow Explanation")
+                    
+                    replay_stats = results.metadata.get('replay_stats', {})
+                    fill_stats = results.metadata.get('fill_stats', {})
+                    
+                    data_points = replay_stats.get('snapshots_processed', 0)
+                    quotes_submitted = fill_stats.get('quotes_submitted', 0)
+                    quotes_filled = fill_stats.get('quotes_filled', 0)
+                    total_fills = fill_stats.get('orders_filled', 0)
+                    
+                    st.write(f"**Market Data Points:** {data_points} candles/snapshots received from Binance")
+                    st.write(f"**Quotes Submitted:** {quotes_submitted} bid/ask quote pairs placed by strategy")
+                    st.write(f"**Quotes Filled:** {quotes_filled} quote pairs that got at least one side filled")
+                    st.write(f"**Total Fills:** {total_fills} individual fill events (each quote has bid + ask)")
+                    
+                    st.info(f"💡 **Fill Rate = {quotes_filled}/{quotes_submitted} = "
+                           f"{(quotes_filled/max(quotes_submitted,1))*100:.1f}%** "
+                           f"(percentage of quotes that got filled, NOT data points)")
+                    
+                    st.markdown("---")
+                
                 trades = results.metrics.trades
                 st.write(f"**Total Trades:** {len(trades)}")
                 
@@ -667,9 +756,10 @@ def display_backtest_results(results):
                         st.metric("Outlier Trades", 
                                  f"{outlier_analysis['outlier_count']} ({outlier_analysis['outlier_pct']:.1f}%)")
                     with col2:
-                        st.metric("Avg P&L (Normal)", 
-                                 f"${outlier_analysis['mean_normal']:.2f}",
-                                 delta=f"{outlier_analysis['mean_with_outliers'] - outlier_analysis['mean_normal']:.2f}")
+                        # Use new three-tier metrics structure
+                        st.metric("Avg P&L (Clean)", 
+                                 f"${outlier_analysis['mean_clean']:.2f}",
+                                 delta=f"{outlier_analysis['mean_raw'] - outlier_analysis['mean_clean']:.2f}")
                     with col3:
                         st.metric("Outlier Impact", 
                                  f"${outlier_analysis['total_outlier_impact']:.2f}")
@@ -678,19 +768,49 @@ def display_backtest_results(results):
                         st.warning(f"⚠️ **{outlier_analysis['outlier_count']} outlier trades detected** "
                                   f"(>{outlier_analysis['z_threshold']}σ from mean)")
                         
+                        # Show outlier type breakdown
+                        if 'type_counts' in outlier_analysis and outlier_analysis['type_counts']:
+                            st.write("**Outlier Classification:**")
+                            for otype, count in outlier_analysis['type_counts'].items():
+                                st.write(f"  - {otype}: {count}")
+                        
+                        # Show removed vs kept
+                        if outlier_analysis.get('removed_count', 0) > 0:
+                            st.error(f"🗑️ **{outlier_analysis['removed_count']} artefacts removed** "
+                                   f"(DATA_SPIKE, STALE_FILL, SCALING_ERROR, POSITION_BLOWUP)")
+                        
+                        if outlier_analysis.get('kept_count', 0) > 0:
+                            st.info(f"✅ **{outlier_analysis['kept_count']} genuine outliers kept** "
+                                  f"(REGIME_SHIFT, STATISTICAL_TAIL)")
+                        
                         st.write("**Outlier Details:**")
                         for i, trade in enumerate(outlier_analysis['outlier_trades'][:5]):  # Show first 5
+                            # Enhanced display with classification
+                            otype = trade.get('outlier_type', 'UNKNOWN')
+                            cause = trade.get('root_cause', 'N/A')
                             st.write(f"  - Trade #{i+1}: P&L=${trade['pnl']:.2f}, "
-                                   f"Side={trade['side']}, Qty={trade['quantity']:.4f}")
+                                   f"Type={otype}, Side={trade['side']}, Qty={trade['quantity']:.4f}")
+                            st.caption(f"    Diagnosis: {cause}")
                         
                         if len(outlier_analysis['outlier_trades']) > 5:
                             st.write(f"  ... and {len(outlier_analysis['outlier_trades']) - 5} more")
                         
-                        # Adjusted metrics
-                        st.info(f"💡 **Adjusted Avg P&L (excluding outliers):** ${outlier_analysis['mean_normal']:.2f} per trade")
-                        st.info(f"📉 **This is {abs(outlier_analysis['mean_with_outliers'] - outlier_analysis['mean_normal']) / outlier_analysis['mean_with_outliers'] * 100:.1f}% "
-                               f"{'lower' if outlier_analysis['mean_normal'] < outlier_analysis['mean_with_outliers'] else 'higher'} "
-                               f"than reported avg**")
+                        # Three-tier metrics reporting
+                        st.write("**📊 Three-Tier Metrics (Professional Reporting):**")
+                        col_a, col_b, col_c = st.columns(3)
+                        with col_a:
+                            st.metric("Raw", f"${outlier_analysis['mean_raw']:.2f}", 
+                                    help="All trades, no filtering")
+                        with col_b:
+                            st.metric("Clean", f"${outlier_analysis['mean_clean']:.2f}",
+                                    help="Artefacts removed, genuine events kept")
+                        with col_c:
+                            st.metric("Winsorized", f"${outlier_analysis['mean_winsorized']:.2f}",
+                                    help="Statistical tails capped at ±3σ")
+                        
+                        # Impact analysis
+                        impact_pct = abs(outlier_analysis['mean_raw'] - outlier_analysis['mean_clean']) / abs(outlier_analysis['mean_raw']) * 100 if outlier_analysis['mean_raw'] != 0 else 0
+                        st.info(f"📉 **Outlier Impact:** {impact_pct:.1f}% difference between raw and clean metrics")
                     else:
                         st.success("✅ No statistical outliers detected - all trades within 3σ of mean")
                 trades = results.metrics.trades

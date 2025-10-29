@@ -15,14 +15,10 @@ from .replay_engine import (
     TickData,
     BacktestEvent
 )
-from .fill_simulator import (
-    FillSimulator,
-    FillEvent,
-    FillReason,
-    MarketState
-)
 from .fill_simulator_fifo import (
     FIFOFillSimulator,
+    FillEvent,
+    FillReason,
     LimitOrder,
     TradeEvent,
     LOBSnapshot
@@ -43,11 +39,9 @@ __all__ = [
     'HistoricalDataLoader',
     'TickData',
     'BacktestEvent',
-    'FillSimulator',
+    'FIFOFillSimulator',
     'FillEvent', 
     'FillReason',
-    'MarketState',
-    'FIFOFillSimulator',
     'LimitOrder',
     'TradeEvent',
     'LOBSnapshot',

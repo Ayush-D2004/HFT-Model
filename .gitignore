@@ -13,6 +13,7 @@ api_keys.json
 # IDE settings (keep private)
 .vscode/
 .copilot-instructions
+.copilot_outliers
 
 # Trading data and results
 data/

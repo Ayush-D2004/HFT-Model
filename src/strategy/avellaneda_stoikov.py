@@ -127,7 +127,10 @@ class AvellanedaStoikovPricer:
             # FIX #3: Normalize by time delta to get per-second volatility
             # This ensures σ is consistent regardless of sampling rate
             dt = timestamp - self.timestamp
-            dt = max(dt, 1e-6)  # Prevent division by zero
+            
+            # ✅ FIX #4: Add minimum dt threshold (0.1 seconds)
+            # Prevents artificial volatility inflation from rapid updates
+            dt = max(dt, 0.1)  # Minimum 100ms between updates (was 1e-6)
             
             # Normalize return by sqrt(dt) to get per-second vol
             # Var(r/√dt) = Var(r)/dt, so σ_per_sec = σ_observed/√dt
@@ -226,6 +229,7 @@ class AvellanedaStoikovPricer:
         Calculate reservation (indifference) price with professional inventory penalty.
         
         FIX #1: Keep adjustments in basis points (not dollar terms) to avoid over-scaling.
+        FIX #5: Dynamic cap based on position size to prevent blow-ups.
         The A-S indifference price should shift by tens of bps, not thousands.
         
         r = s - adjustment_in_bps * s / 10000
@@ -244,18 +248,36 @@ class AvellanedaStoikovPricer:
         # Multiply by 10000 to get bps
         adj_bp = base_adjustment_fraction * 1e4
         
-        # FIX #1: Cap adjustment at ±10 bps (0.1% of price) for professional market making
-        # This prevents extreme quote skew that kills fill rate
-        # For $100k BTC: ±10 bps = ±$100 adjustment (reasonable for MM)
-        adj_bp = np.clip(adj_bp, -10.0, 10.0)
+        # ✅ FIX #5: DYNAMIC CAP based on position size (prevents blow-ups)
+        # Small positions: tighter cap (10 bps)
+        # Large positions: wider cap (30 bps) to force mean reversion
+        position_ratio = abs(self.inventory) / self.max_inventory
+        
+        if position_ratio < 0.3:
+            # Small position (<30% of max): standard 10 bps cap
+            max_adj_bp = 10.0
+        elif position_ratio < 0.5:
+            # Moderate position (30-50%): 15 bps cap
+            max_adj_bp = 15.0
+        elif position_ratio < 0.7:
+            # Large position (50-70%): 20 bps cap
+            max_adj_bp = 20.0
+        else:
+            # Very large position (>70%): 30 bps cap to force unwind
+            max_adj_bp = 30.0
+        
+        # Apply dynamic cap
+        adj_bp = np.clip(adj_bp, -max_adj_bp, max_adj_bp)
         
         # Convert back to price adjustment
         scaled_adjustment = adj_bp * midprice / 1e4
         
         # Log significant adjustments (>2 bps) to monitor effectiveness
         if abs(adj_bp) > 2.0:
-            logger.debug(f"Inventory penalty: position={self.inventory:.4f}, "
-                        f"adjustment={adj_bp:.2f} bps (${scaled_adjustment:.2f})")
+            logger.debug(f"Inventory penalty: position={self.inventory:.4f} "
+                        f"({position_ratio*100:.1f}% of max), "
+                        f"adjustment={adj_bp:.2f} bps (cap={max_adj_bp:.0f} bps), "
+                        f"price=${scaled_adjustment:.2f}")
         
         return midprice - scaled_adjustment
     
@@ -334,18 +356,49 @@ class AvellanedaStoikovPricer:
         
         # Inventory adjustment - reduce size as inventory grows
         inventory_ratio = abs(self.inventory) / self.max_inventory
-        inventory_factor = max(0.1, 1.0 - inventory_ratio * 0.8)
+        
+        # ✅ AGGRESSIVE inventory reduction to prevent position build-up
+        # At 50% of max: reduce size to 50%
+        # At 75% of max: reduce size to 25%
+        # At 90%+ of max: reduce size to 10% (emergency only)
+        if inventory_ratio >= 0.9:
+            inventory_factor = 0.1  # Emergency: almost at limit
+        elif inventory_ratio >= 0.75:
+            inventory_factor = 0.25  # Critical: 75-90% of max
+        elif inventory_ratio >= 0.5:
+            inventory_factor = 0.5  # Warning: 50-75% of max
+        elif inventory_ratio >= 0.3:
+            inventory_factor = 0.7  # Moderate: 30-50% of max
+        else:
+            inventory_factor = 1.0  # Normal: <30% of max
         
         # Volatility adjustment - reduce size in high volatility
         vol_factor = 1.0 / (1.0 + 10 * volatility / 0.001) 
         
         # Side-specific adjustment based on inventory
+        # ✅ AGGRESSIVE side skewing to force position unwind
         if side == 'bid' and self.inventory > 0:
-            # Long inventory, less aggressive on bids
-            side_factor = max(0.5, 1.0 - inventory_ratio * 0.5)
+            # Long inventory, MUCH less aggressive on bids (don't want to buy more)
+            if inventory_ratio >= 0.7:
+                side_factor = 0.1  # Almost stop buying
+            elif inventory_ratio >= 0.5:
+                side_factor = 0.3  # Reduce buying significantly
+            else:
+                side_factor = max(0.5, 1.0 - inventory_ratio * 0.8)
         elif side == 'ask' and self.inventory < 0:
-            # Short inventory, less aggressive on asks  
-            side_factor = max(0.5, 1.0 - inventory_ratio * 0.5)
+            # Short inventory, MUCH less aggressive on asks (don't want to sell more)
+            if inventory_ratio >= 0.7:
+                side_factor = 0.1  # Almost stop selling
+            elif inventory_ratio >= 0.5:
+                side_factor = 0.3  # Reduce selling significantly
+            else:
+                side_factor = max(0.5, 1.0 - inventory_ratio * 0.8)
+        elif side == 'bid' and self.inventory < 0:
+            # Short inventory, MORE aggressive on bids (want to buy to cover short)
+            side_factor = 1.5  # Increase bid size to unwind faster
+        elif side == 'ask' and self.inventory > 0:
+            # Long inventory, MORE aggressive on asks (want to sell to unwind)
+            side_factor = 1.5  # Increase ask size to unwind faster
         else:
             side_factor = 1.0
         
@@ -368,28 +421,49 @@ class AvellanedaStoikovPricer:
         - Maximum spread limits
         - Inventory position limits
         - Market structure constraints
+        
+        🔧 FIX: Enforce MINIMUM 1-tick separation to prevent crossed quotes
         """
         # Ensure minimum tick increments
         bid = self.round_to_tick(bid)
         ask = self.round_to_tick(ask)
         
-        # Prevent crossed quotes
-        if bid >= ask:
-            logger.warning(f"Crossed quotes detected: bid={bid}, ask={ask}")
-            mid = (bid + ask) / 2
-            bid = mid - self.tick_size / 2
-            ask = mid + self.tick_size / 2
-            bid = self.round_to_tick(bid)
-            ask = self.round_to_tick(ask)
+        # 🔧 CRITICAL FIX: Enforce minimum 3-tick spread AFTER rounding
+        # This prevents bid==ask which causes crossed quote warnings
+        # At $0.01 tick_size: 3 ticks = $0.03 minimum spread
+        # This is ~0.08 bps at $3800 ETH - extremely tight but prevents crossing
+        min_ticks_apart = 3  # At least 3 ticks difference (was 1, but rounding made them equal)
+        min_tick_spread = min_ticks_apart * self.tick_size
+        config_min_spread = config.trading.min_spread
         
-        # Ensure minimum spread
-        min_spread = max(self.tick_size, config.trading.min_spread)
-        if ask - bid < min_spread:
-            spread_adjustment = (min_spread - (ask - bid)) / 2
-            bid -= spread_adjustment
-            ask += spread_adjustment
-            bid = self.round_to_tick(bid)
-            ask = self.round_to_tick(ask)
+        # Use the LARGER of: 3 ticks OR configured min_spread
+        min_required_spread = max(min_tick_spread, config_min_spread)
+        
+        actual_spread = ask - bid
+        
+        if actual_spread < min_required_spread:
+            logger.debug(f"Adjusting spread from {actual_spread:.2f} to {min_required_spread:.2f}")
+            
+            # Calculate how much to adjust each side
+            spread_deficit = min_required_spread - actual_spread
+            half_adjustment = spread_deficit / 2.0
+            
+            # Move quotes apart symmetrically around midpoint
+            mid = (bid + ask) / 2.0
+            bid = self.round_to_tick(mid - min_required_spread / 2.0)
+            ask = self.round_to_tick(mid + min_required_spread / 2.0)
+            
+            # FINAL SAFETY: If still equal after rounding, force 1 tick apart
+            if bid >= ask:
+                logger.warning(f"Quotes still crossed after adjustment: bid={bid}, ask={ask}")
+                # Use midprice as anchor
+                bid = self.round_to_tick(midprice - min_required_spread / 2.0)
+                ask = bid + min_required_spread
+                ask = self.round_to_tick(ask)
+                
+                # LAST RESORT: If ask rounds down to bid, force it up
+                if ask <= bid:
+                    ask = bid + self.tick_size
         
         # Inventory position limits - STRENGTHENED FOR BETTER BALANCE
         inventory_pct = abs(self.inventory) / self.max_inventory
@@ -417,6 +491,17 @@ class AvellanedaStoikovPricer:
             
             bid = self.round_to_tick(bid)
             ask = self.round_to_tick(ask)
+        
+        # 🔧 FINAL SAFETY CHECK: Ensure quotes are NEVER crossed after all adjustments
+        if ask <= bid:
+            logger.warning(f"⚠️ Quotes crossed after inventory adjustment: bid={bid}, ask={ask}")
+            # Force minimum separation - DON'T round ask after this or it might round back to bid!
+            min_sep = max(self.tick_size, config.trading.min_spread)
+            ask = bid + min_sep
+            # Only round UP to next tick, never down
+            remainder = ask % self.tick_size
+            if remainder > 1e-10:  # Has fractional ticks
+                ask = ask - remainder + self.tick_size  # Round up to next tick
         
         return bid, ask
     
@@ -522,7 +607,30 @@ class AvellanedaStoikovPricer:
         
         # Calculate quote sizes
         bid_size = self.calculate_quote_size(s, sigma, 'bid')
-        ask_size = self.calculate_quote_size(s, sigma, 'ask') 
+        ask_size = self.calculate_quote_size(s, sigma, 'ask')
+        
+        # ✅ CRITICAL: At extreme positions (>80% of max), ONLY quote on unwinding side
+        # This prevents position from growing further
+        inventory_ratio = abs(self.inventory) / self.max_inventory
+        if inventory_ratio > 0.80:
+            if self.inventory > 0:
+                # Long position: ONLY allow selling (ask), no buying (bid)
+                bid_size = 0.0  # Cancel bid side completely
+                logger.warning(f"⚠️ EXTREME LONG POSITION ({inventory_ratio*100:.0f}%): "
+                             f"Only quoting ASK side to unwind")
+            else:
+                # Short position: ONLY allow buying (bid), no selling (ask)
+                ask_size = 0.0  # Cancel ask side completely
+                logger.warning(f"⚠️ EXTREME SHORT POSITION ({inventory_ratio*100:.0f}%): "
+                             f"Only quoting BID side to unwind")
+        elif inventory_ratio > 0.60:
+            # At 60-80%, heavily favor unwinding side but don't completely stop other side
+            if self.inventory > 0:
+                bid_size *= 0.2  # Drastically reduce bid size
+                ask_size *= 1.5  # Increase ask size
+            else:
+                ask_size *= 0.2  # Drastically reduce ask size
+                bid_size *= 1.5  # Increase bid size
         
         # Calculate confidence based on market conditions
         confidence = self._calculate_quote_confidence(sigma, k)

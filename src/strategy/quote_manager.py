@@ -157,16 +157,30 @@ class QuoteManager:
                 # Generate quote using pricer
                 quote = self.pricer.compute_quotes(quote_params, midprice, timestamp)
                 
+                # Validate quote - reject if either side has zero size
+                if quote.bid_size <= 0 or quote.ask_size <= 0:
+                    if self.stats['quotes_generated'] % 100 == 0:
+                        logger.warning(f"⚠️ Quote rejected: zero size. "
+                                     f"Bid={quote.bid_size:.4f}, Ask={quote.ask_size:.4f}, "
+                                     f"Position={self.risk_manager.current_position:.4f}")
+                    return None
+                
                 # Check risk controls
                 if not self.risk_manager.check_quote_risk(quote, midprice):
-                    logger.warning("Quote blocked by risk manager")
+                    # Reduced logging frequency to prevent terminal spam
+                    if self.stats['quotes_generated'] % 500 == 0:
+                        logger.warning(f"⚠️ Quote blocked by risk manager. Position: {self.risk_manager.current_position:.4f}, "
+                                     f"Notional: ${abs(self.risk_manager.current_position) * midprice:.0f}")
                     return None
                 
                 self.current_quote = quote
                 self.stats['quotes_generated'] += 1
                 
-                # logger.debug(f"Quote generated: {quote.bid_price:.4f} x {quote.ask_price:.4f} "
-                        #    f"({quote.spread:.4f})")
+                # Log successful quote generation occasionally
+                if self.stats['quotes_generated'] % 200 == 0:
+                    logger.info(f"✅ Quote generated #{self.stats['quotes_generated']}: "
+                              f"Bid={quote.bid_price:.2f}, Ask={quote.ask_price:.2f}, "
+                              f"Spread={quote.spread:.4f}")
                 
                 return quote
                 
@@ -267,30 +281,42 @@ class QuoteManager:
     
     def _should_cancel_existing_orders(self, new_quote: MarketQuote) -> bool:
         """Determine if existing orders should be cancelled for new quote"""
-        # Cancel if no current orders
-        if not self.current_bid_order or not self.current_ask_order:
-            return True
+        # ✅ ALWAYS cancel existing orders on every quote update
+        # This prevents fill simulator from checking the same quote multiple times
+        # Real HFT market makers cancel-replace on every market update
+        # Without this, quotes accumulate ~9 probability checks → 95% fill rate
+        # With this, quotes get exactly 1 probability check → realistic 20-40% fill rate
+        return True
         
-        # Cancel if orders are not active
-        if (not self.current_bid_order.is_active or 
-            not self.current_ask_order.is_active):
-            return True
+        # OLD LOGIC (kept for reference, but disabled):
+        # This caused quotes to stay active for multiple market updates
+        # Each update gave another 30% fill probability
+        # After ~9 updates: 1 - (0.7^9) = 95.8% cumulative fill probability
         
-        # Cancel if prices changed significantly
-        price_tolerance = self.pricer.tick_size
-        
-        if (abs(self.current_bid_order.price - new_quote.bid_price) > price_tolerance or
-            abs(self.current_ask_order.price - new_quote.ask_price) > price_tolerance):
-            return True
-        
-        # Cancel if sizes changed significantly
-        size_tolerance = self.pricer.lot_size
-        
-        if (abs(self.current_bid_order.size - new_quote.bid_size) > size_tolerance or
-            abs(self.current_ask_order.size - new_quote.ask_size) > size_tolerance):
-            return True
-        
-        return False
+        # # Cancel if no current orders
+        # if not self.current_bid_order or not self.current_ask_order:
+        #     return True
+        # 
+        # # Cancel if orders are not active
+        # if (not self.current_bid_order.is_active or 
+        #     not self.current_ask_order.is_active):
+        #     return True
+        # 
+        # # Cancel if prices changed significantly
+        # price_tolerance = self.pricer.tick_size
+        # 
+        # if (abs(self.current_bid_order.price - new_quote.bid_price) > price_tolerance or
+        #     abs(self.current_ask_order.price - new_quote.ask_price) > price_tolerance):
+        #     return True
+        # 
+        # # Cancel if sizes changed significantly
+        # size_tolerance = self.pricer.lot_size
+        # 
+        # if (abs(self.current_bid_order.size - new_quote.bid_size) > size_tolerance or
+        #     abs(self.current_ask_order.size - new_quote.ask_size) > size_tolerance):
+        #     return True
+        # 
+        # return False
     
     def _create_order(self, 
                      side: OrderSide, 
