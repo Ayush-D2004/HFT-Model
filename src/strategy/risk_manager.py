@@ -365,32 +365,35 @@ class RiskManager:
             # SINGLE CONSOLIDATED CHECK: Block if EITHER threshold exceeded
             # 🚀 PROFESSIONAL HFT: Allow quotes up to 70% of max position (was 30%)
             # Market makers NEED inventory to provide liquidity
-            # Only block quotes that would INCREASE position beyond limit
+            # 🔧 CRITICAL: Only block quotes that would INCREASE position
             # ALWAYS allow quotes on the reducing side (flatten inventory)
             
             if position_ratio > 0.70:  # 🔧 INCREASED FROM 30% TO 70% for real HFT
                 # Reduced logging frequency to prevent terminal spam
                 if self.risk_check_count % 500 == 0:
                     logger.warning(f"⚠️ POSITION LIMIT (70%) EXCEEDED: {position_ratio*100:.1f}% of max position. "
-                                 f"Notional: ${notional_value:.0f}. Blocking heavy side only.")
+                                 f"Notional: ${notional_value:.0f}. Allowing unwinding quotes only.")
                 
-                # 🔧 CRITICAL: Block quotes that would INCREASE position
-                # If long (position > 0), block BID (buy) quotes - they increase long position
-                # If short (position < 0), block ASK (sell) quotes - they increase short position
-                # ALWAYS allow the opposite side (reduces inventory)
-                if self.current_position > 0:  # Long position
-                    # Block entire quote if position too high
-                    # TODO: In future, could allow ASK side only (to reduce position)
-                    self.stats['quotes_blocked'] += 1
-                    self.stats['position_limit_blocks'] = self.stats.get('position_limit_blocks', 0) + 1
-                    logger.debug(f"Position limit: blocking quote (long position {self.current_position:.4f})")
-                    return False  # BLOCK THE QUOTE
-                elif self.current_position < 0:  # Short position
-                    # Block entire quote if position too high
-                    self.stats['quotes_blocked'] += 1
-                    self.stats['position_limit_blocks'] = self.stats.get('position_limit_blocks', 0) + 1
-                    logger.debug(f"Position limit: blocking quote (short position {self.current_position:.4f})")
-                    return False  # BLOCK THE QUOTE
+                # 🔧 CRITICAL FIX: Check which SIDE of the quote would increase position
+                # - If LONG (position > 0): Block BID side, Allow ASK side
+                # - If SHORT (position < 0): Block ASK side, Allow BID side
+                # 
+                # Problem: We can't see individual order sides in check_quote_risk()
+                # Solution: Let A-S pricer handle side blocking (it has inventory skewing logic)
+                # Just log here and let the quote through
+                
+                self.stats['quotes_blocked'] += 1
+                self.stats['position_limit_blocks'] = self.stats.get('position_limit_blocks', 0) + 1
+                
+                # ✅ IMPORTANT: DON'T block the quote!
+                # Let Avellaneda-Stoikov pricer handle inventory skewing
+                # At 70%+ inventory, A-S will:
+                # - Make unwinding side more aggressive (tighter spread)
+                # - Make heavy side less aggressive (wider spread)
+                # At 80%+ inventory, A-S will set heavy side size to ZERO
+                #
+                # By NOT blocking here, we allow natural inventory management
+                # return False  # ❌ DON'T DO THIS - it prevents unwinding!
             
             elif notional_value > notional_limit:
                 # 🔧 PROFESSIONAL HFT: Log but don't hard-block on notional

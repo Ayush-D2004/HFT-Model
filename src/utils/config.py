@@ -35,10 +35,12 @@ class TradingConfig(BaseModel):
     # Fee impact: 0.07% round-trip = $0.014 per $20 trade = $1.40 per $2000
     lot_size: float = Field(default=0.0005, description="Minimum quantity (OPTIMIZED: $2 notional)")
     
-    # 🚀 PROFESSIONAL HFT: Moderate max position for controlled risk
-    # Allows ~10 incremental fills before hitting limit
-    # At 0.0005 per trade: 10 fills = 0.005 BTC position
-    max_position: float = Field(default=0.01, description="Maximum position size (10-20 increments)")
+    # 🚀 BALANCED HFT: Optimal position limits
+    # Sweet spot: 0.025 BTC (~$2,800 notional at $113k BTC)
+    # - Large enough to allow profitable trading (50 fills)
+    # - Small enough to enforce inventory discipline
+    # - Allows position to breathe without accumulation
+    max_position: float = Field(default=0.025, description="Maximum position size (BALANCED: 50 fills)")
     
     # 🔧 PROFITABILITY FIX: Lower risk aversion = wider quotes = more profit per trade
     # Reduced from 0.015 to 0.005 for more aggressive market making

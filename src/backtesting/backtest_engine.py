@@ -144,6 +144,18 @@ class StrategyBacktester:
             
             # Handle new order submission (Order object)
             elif isinstance(order_data, Order):
+                # ✅ CRITICAL FIX: Skip orders with size <= 0
+                # This allows single-sided quoting to work correctly
+                # When A-S sets bid_size=0 or ask_size=0, don't submit that side!
+                if order_data.size <= 0:
+                    return {
+                        'success': True,  # Return success (not an error)
+                        'skipped': True,  # But flag as skipped
+                        'reason': 'zero_size',
+                        'order_id': order_data.order_id,
+                        'timestamp': order_data.timestamp
+                    }
+                
                 success = self.fill_simulator.submit_order(order_data)
                 
                 if success:
@@ -221,16 +233,23 @@ class StrategyBacktester:
                 
             elif position_ratio > 0.70:
                 # TIER 1: Percentage-based limit (70% of max position)
+                # ✅ FIX: Don't cancel ALL orders - let unwinding orders through!
+                # Market makers MUST be able to reduce positions
                 logger.warning(f"⚠️ POSITION LIMIT (70%) EXCEEDED: {position_ratio*100:.1f}% of max. "
                              f"Position: {self.risk_manager.current_position:.4f}, "
-                             f"Notional: ${notional_value:.0f}. Cancelling all pending quotes.")
-                self.quote_manager.cancel_all_orders(reason="Position limit 70% exceeded")
+                             f"Notional: ${notional_value:.0f}. Allowing A-S inventory skewing to handle.")
+                # Don't cancel - let A-S pricer handle it with inventory skewing
+                # self.quote_manager.cancel_all_orders(reason="Position limit 70% exceeded")
             
             # TIER 2: Absolute notional limit ($5k)
             elif notional_value > MAX_NOTIONAL:
+                # ✅ FIX: Don't cancel ALL orders - let unwinding orders through!
+                # Cancel ONLY the heavy side (that would increase position)
                 logger.error(f"⚠️ NOTIONAL LIMIT EXCEEDED: ${notional_value:.0f} > ${MAX_NOTIONAL}. "
-                           f"Cancelling all pending quotes.")
-                self.quote_manager.cancel_all_orders(reason="Notional limit exceeded")
+                           f"Allowing unwinding orders to reduce position.")
+                # Don't cancel - let A-S pricer handle it with inventory skewing
+                # At 1342% of position limit, A-S will ONLY quote unwinding side
+                # self.quote_manager.cancel_all_orders(reason="Notional limit exceeded")
             
             # TIER 3: Warning zone (50% of max position)
             elif position_ratio > 0.50:

@@ -157,13 +157,28 @@ class QuoteManager:
                 # Generate quote using pricer
                 quote = self.pricer.compute_quotes(quote_params, midprice, timestamp)
                 
-                # Validate quote - reject if either side has zero size
-                if quote.bid_size <= 0 or quote.ask_size <= 0:
+                # ✅ FIX: Allow single-sided quotes for inventory management
+                # A-S may set bid_size=0 (when long) or ask_size=0 (when short)
+                # This is INTENTIONAL for unwinding positions - don't reject!
+                if quote.bid_size <= 0 and quote.ask_size <= 0:
+                    # BOTH sides zero - this is an error, reject
                     if self.stats['quotes_generated'] % 100 == 0:
-                        logger.warning(f"⚠️ Quote rejected: zero size. "
-                                     f"Bid={quote.bid_size:.4f}, Ask={quote.ask_size:.4f}, "
+                        logger.warning(f"⚠️ Quote rejected: BOTH sides zero. "
                                      f"Position={self.risk_manager.current_position:.4f}")
                     return None
+                
+                # Log single-sided quoting (important for debugging)
+                if quote.bid_size <= 0 or quote.ask_size <= 0:
+                    if self.stats['quotes_generated'] % 50 == 0:
+                        if quote.bid_size <= 0:
+                            logger.info(f"📊 SINGLE-SIDED QUOTE: Only ASK (unwinding long). "
+                                      f"Position={self.risk_manager.current_position:.4f}, "
+                                      f"Inventory%={(abs(self.risk_manager.current_position)/self.pricer.max_inventory)*100:.0f}%")
+                        else:
+                            logger.info(f"📊 SINGLE-SIDED QUOTE: Only BID (unwinding short). "
+                                      f"Position={self.risk_manager.current_position:.4f}, "
+                                      f"Inventory%={(abs(self.risk_manager.current_position)/self.pricer.max_inventory)*100:.0f}%")
+
                 
                 # Check risk controls
                 if not self.risk_manager.check_quote_risk(quote, midprice):
@@ -203,20 +218,26 @@ class QuoteManager:
                 if cancel_needed:
                     self._cancel_existing_orders("Quote update")
                 
-                # Generate new orders
-                bid_order = self._create_order(
-                    side=OrderSide.BID,
-                    price=quote.bid_price,
-                    size=quote.bid_size,
-                    timestamp=quote.timestamp
-                )
+                # ✅ FIX: Only create orders for non-zero sides (single-sided quoting)
+                # This allows A-S inventory skewing to work properly
+                bid_order = None
+                ask_order = None
                 
-                ask_order = self._create_order(
-                    side=OrderSide.ASK,
-                    price=quote.ask_price,
-                    size=quote.ask_size,
-                    timestamp=quote.timestamp
-                )
+                if quote.bid_size > 0:
+                    bid_order = self._create_order(
+                        side=OrderSide.BID,
+                        price=quote.bid_price,
+                        size=quote.bid_size,
+                        timestamp=quote.timestamp
+                    )
+                
+                if quote.ask_size > 0:
+                    ask_order = self._create_order(
+                        side=OrderSide.ASK,
+                        price=quote.ask_price,
+                        size=quote.ask_size,
+                        timestamp=quote.timestamp
+                    )
                 
                 # Place orders via callback
                 success = True
@@ -224,27 +245,29 @@ class QuoteManager:
                 
                 if self.order_callback:
                     try:
-                        # Place bid order
-                        bid_result = self.order_callback(bid_order)
-                        if bid_result.get('success', True):
-                            bid_order.exchange_id = bid_result.get('order_id')
-                            bid_order.status = OrderStatus.ACTIVE
-                            self.active_orders[bid_order.order_id] = bid_order
-                            self.current_bid_order = bid_order
-                        else:
-                            success = False
-                            message += f" Bid failed: {bid_result.get('error', 'Unknown')}"
+                        # Place bid order (if exists)
+                        if bid_order:
+                            bid_result = self.order_callback(bid_order)
+                            if bid_result.get('success', True):
+                                bid_order.exchange_id = bid_result.get('order_id')
+                                bid_order.status = OrderStatus.ACTIVE
+                                self.active_orders[bid_order.order_id] = bid_order
+                                self.current_bid_order = bid_order
+                            else:
+                                success = False
+                                message += f" Bid failed: {bid_result.get('error', 'Unknown')}"
                         
-                        # Place ask order  
-                        ask_result = self.order_callback(ask_order)
-                        if ask_result.get('success', True):
-                            ask_order.exchange_id = ask_result.get('order_id')
-                            ask_order.status = OrderStatus.ACTIVE
-                            self.active_orders[ask_order.order_id] = ask_order
-                            self.current_ask_order = ask_order
-                        else:
-                            success = False
-                            message += f" Ask failed: {ask_result.get('error', 'Unknown')}"
+                        # Place ask order (if exists)
+                        if ask_order:
+                            ask_result = self.order_callback(ask_order)
+                            if ask_result.get('success', True):
+                                ask_order.exchange_id = ask_result.get('order_id')
+                                ask_order.status = OrderStatus.ACTIVE
+                                self.active_orders[ask_order.order_id] = ask_order
+                                self.current_ask_order = ask_order
+                            else:
+                                success = False
+                                message += f" Ask failed: {ask_result.get('error', 'Unknown')}"
                             
                     except Exception as e:
                         success = False
@@ -252,12 +275,14 @@ class QuoteManager:
                         logger.error(f"Order callback failed: {e}")
                 else:
                     # Simulation mode - just mark as active
-                    bid_order.status = OrderStatus.ACTIVE
-                    ask_order.status = OrderStatus.ACTIVE
-                    self.active_orders[bid_order.order_id] = bid_order
-                    self.active_orders[ask_order.order_id] = ask_order
-                    self.current_bid_order = bid_order
-                    self.current_ask_order = ask_order
+                    if bid_order:
+                        bid_order.status = OrderStatus.ACTIVE
+                        self.active_orders[bid_order.order_id] = bid_order
+                        self.current_bid_order = bid_order
+                    if ask_order:
+                        ask_order.status = OrderStatus.ACTIVE
+                        self.active_orders[ask_order.order_id] = ask_order
+                        self.current_ask_order = ask_order
                 
                 if success:
                     self.stats['quotes_sent'] += 1

@@ -1064,7 +1064,7 @@ def main():
     
     # App header
     st.title("🚀 HFT Trading Dashboard")
-    st.markdown("**Professional High-Frequency Trading System**")
+    st.markdown("**High-Frequency Trading System**")
     
     # Navigation tabs
     tab1, tab2 = st.tabs(["📊 Backtesting", "🔴 Live Trading"])
