@@ -609,28 +609,40 @@ class AvellanedaStoikovPricer:
         bid_size = self.calculate_quote_size(s, sigma, 'bid')
         ask_size = self.calculate_quote_size(s, sigma, 'ask')
         
-        # ✅ CRITICAL: At extreme positions (>80% of max), ONLY quote on unwinding side
-        # This prevents position from growing further
+        # 🛡️ PROFESSIONAL INVENTORY CONTROL - 3 Tiers (Balanced Performance & Safety)
+        # LOOSENED thresholds to maintain high fill rate & trading activity
+        # Based on: Original 14.43% return baseline needs MORE room to operate
+        
         inventory_ratio = abs(self.inventory) / self.max_inventory
-        if inventory_ratio > 0.80:
+        
+        if inventory_ratio > 0.90:
+            # TIER 3: HARD STOP (>90%) - Single-sided only
+            # Only activate at extreme levels to preserve trading
             if self.inventory > 0:
-                # Long position: ONLY allow selling (ask), no buying (bid)
-                bid_size = 0.0  # Cancel bid side completely
-                logger.warning(f"⚠️ EXTREME LONG POSITION ({inventory_ratio*100:.0f}%): "
-                             f"Only quoting ASK side to unwind")
+                bid_size = 0.0  # Stop buying
+                ask_size *= 2.5  # Moderate unwinding (not 3x)
+                if self.stats['quotes_generated'] % 100 == 0:
+                    logger.warning(f"🛑 HARD STOP LONG ({inventory_ratio*100:.0f}%): "
+                                 f"BID=0, ASK×2.5 | pos={self.inventory:.4f}")
             else:
-                # Short position: ONLY allow buying (bid), no selling (ask)
-                ask_size = 0.0  # Cancel ask side completely
-                logger.warning(f"⚠️ EXTREME SHORT POSITION ({inventory_ratio*100:.0f}%): "
-                             f"Only quoting BID side to unwind")
+                ask_size = 0.0  # Stop selling
+                bid_size *= 2.5  # Moderate unwinding
+                if self.stats['quotes_generated'] % 100 == 0:
+                    logger.warning(f"🛑 HARD STOP SHORT ({inventory_ratio*100:.0f}%): "
+                                 f"BID×2.5, ASK=0 | pos={self.inventory:.4f}")
+        
         elif inventory_ratio > 0.60:
-            # At 60-80%, heavily favor unwinding side but don't completely stop other side
+            # TIER 2: MODERATE CONTROL (60-90%) - Light skewing
+            # 1.5:1 ratio - just enough to encourage unwinding
             if self.inventory > 0:
-                bid_size *= 0.2  # Drastically reduce bid size
-                ask_size *= 1.5  # Increase ask size
+                bid_size *= 0.67  # Reduce buying slightly
+                ask_size *= 1.3   # Increase selling slightly
             else:
-                ask_size *= 0.2  # Drastically reduce ask size
-                bid_size *= 1.5  # Increase bid size
+                ask_size *= 0.67  # Reduce selling slightly
+                bid_size *= 1.3   # Increase buying slightly
+        
+        # TIER 1: (<60%) - Normal operation, minimal adjustment
+        # Let strategy breathe and trade freely
         
         # Calculate confidence based on market conditions
         confidence = self._calculate_quote_confidence(sigma, k)
