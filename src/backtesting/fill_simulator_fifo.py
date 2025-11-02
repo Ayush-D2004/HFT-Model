@@ -335,41 +335,38 @@ class FIFOFillSimulator:
                 if distance_bps > 50:
                     continue
             
-            # 🚀 PROFESSIONAL HFT: Adjusted for tighter spreads (8 bps)
-            # With aggressive quoting near market, fills are more likely
-            # but still maintain realistic 20-40% overall fill rate
-            # Most quotes still DON'T fill - that's normal for passive HFT
+            # 🚀 PROFESSIONAL HFT: Realistic fill probabilities for market making
+            # Balance between selectivity and liquidity provision
+            # Target: 40-60% overall fill rate for competitive market making
             
             if distance_bps <= 0:
                 # At or inside best bid/ask (aggressive quote at market)
-                # � PROFITABILITY FIX: Reduced from 45% → 20%
-                # Lower fills = higher selectivity = better profit per trade
-                base_prob = 0.20  
+                # High probability - these are top-of-book quotes
+                base_prob = 0.65  
             elif distance_bps < 0.5:
                 # Within 0.5 bps of best (excellent competitive quote)
-                # � REDUCED from 35% → 15%
-                base_prob = 0.15  
+                # Very good chance of fill
+                base_prob = 0.50  
             elif distance_bps < 2.0:
                 # 0.5-2 bps away (good competitive quote)
-                # � REDUCED from 25% → 12%
-                base_prob = 0.12  
+                # Decent fill probability
+                base_prob = 0.35  
             elif distance_bps < 5.0:
                 # 2-5 bps away (moderate competitive quote)
-                # � REDUCED from 18% → 8%
-                base_prob = 0.08  
+                # Moderate probability
+                base_prob = 0.22  
             elif distance_bps < 10.0:
                 # 5-10 bps away (less competitive)
-                base_prob = 0.05  # Reduced from 10%
+                base_prob = 0.12
             elif distance_bps < 20.0:
                 # 10-20 bps away (poor quote placement)
-                base_prob = 0.02  # Reduced from 5%
+                base_prob = 0.05
             else:
                 # >20 bps away (very unlikely to fill)
-                base_prob = 0.005  # Reduced from 1%
+                base_prob = 0.01
             
-            # Adjust for trade rate (cap at 30% for realistic HFT)
-            # 🔧 PROFITABILITY FIX: Reduced cap from 50% → 30%
-            final_prob = min(base_prob * min(trade_rate * 2, 1.0), 0.30)
+            # Adjust for trade rate (cap at 70% for realistic fills)
+            final_prob = min(base_prob * min(trade_rate * 2, 1.0), 0.70)
             
             # DEBUG: Log first few fills to verify probabilities are applied
             if self._sim_fill_count < 5:

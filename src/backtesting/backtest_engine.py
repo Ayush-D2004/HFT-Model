@@ -48,7 +48,7 @@ class BacktestConfig:
     # Strategy parameters - OPTIMIZED FOR HFT MARKET MAKING
     gamma: float = 0.015  # Risk aversion - typical HFT range 0.01-0.02
     time_horizon: float = 10.0  # Time horizon in seconds - HFT uses 5-15s
-    min_spread: float = 0.0035  # Minimum spread 0.35% (35 bps) - INCREASED to beat fees + adverse selection
+    min_spread: float = 0.0008  # Minimum spread 0.08% (8 bps) - competitive HFT spread
     tick_size: float = 0.01
     lot_size: float = 0.01
     

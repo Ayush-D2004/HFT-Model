@@ -116,8 +116,8 @@ def create_backtesting_section():
     
     with col3:
         st.markdown("**Spread & Size**")
-        min_spread = st.number_input("Min Spread", min_value=0.001, max_value=0.05, value=0.01, step=0.001, key="bt_min_spread",
-                                    help="Minimum spread (0.0005 = 0.05% = 5 bps). HFT typical: 5-20 bps", format="%.3f")
+        min_spread = st.number_input("Min Spread", min_value=0.0001, max_value=0.05, value=0.0008, step=0.0001, key="bt_min_spread",
+                                    help="Minimum spread (0.0008 = 0.08% = 8 bps). HFT typical: 5-20 bps. Lower = tighter quotes.", format="%.4f")
         max_drawdown_pct = st.slider(
             "Max Drawdown (%)", 
             1, 50, 10, 1, 
@@ -135,10 +135,10 @@ def create_backtesting_section():
         adv_col1, adv_col2 = st.columns(2)
         with adv_col1:
             tick_size = st.number_input("Tick Size", min_value=0.001, max_value=1.0, value=0.01, step=0.001, 
-                                       help="Price increment. Use 0.01 for most pairs")
+                                       help="Price increment. Use 0.01 for most pairs", key="bt_tick_size")
         with adv_col2:
-            lot_size = st.number_input("Lot Size", min_value=0.001, max_value=1.0, value=0.01, step=0.001,
-                                      help="Minimum order size. Use 0.001 for BTC (realistic HFT size)")
+            lot_size = st.number_input("Lot Size", min_value=0.0001, max_value=1.0, value=0.001, step=0.0001,
+                                      help="Minimum order size. Use 0.001 for BTC (realistic HFT size)", key="bt_lot_size", format="%.4f")
 
     # Error checking
     if start_date >= end_date:
