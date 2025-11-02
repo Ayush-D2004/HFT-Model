@@ -67,7 +67,7 @@ class AvellanedaStoikovPricer:
     
     def __init__(self,
                  tick_size: float = 0.01,
-                 lot_size: float = 0.01,
+                 lot_size: float = 0.001,
                  ewma_alpha: float = 0.2,
                  vol_lookback_sec: int = 60,
                  k_lookback_sec: int = 60,
@@ -779,7 +779,7 @@ if __name__ == "__main__":
     # Initialize pricer
     pricer = AvellanedaStoikovPricer(
         tick_size=0.01,
-        lot_size=0.01,
+        lot_size=0.001,
         ewma_alpha=0.2,
         max_inventory=5.0
     )

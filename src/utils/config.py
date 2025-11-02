@@ -33,7 +33,7 @@ class TradingConfig(BaseModel):
     # Increased from 0.0001 to 0.0005 BTC (~$2/trade at $4000 ETH)
     # Balance: Enough size to overcome fees, small enough for frequent fills
     # Fee impact: 0.07% round-trip = $0.014 per $20 trade = $1.40 per $2000
-    lot_size: float = Field(default=0.01)
+    lot_size: float = Field(default=0.0005, description="Minimum quantity (OPTIMIZED: $2 notional)")
     
     # �️ PROFESSIONAL HFT: Realistic max position for both backtest & live
     # Balance: Large enough to allow strategy to work (avoid over-limiting)
@@ -44,19 +44,20 @@ class TradingConfig(BaseModel):
     max_position: float = Field(default=0.1, description="Maximum position size (realistic for backtest & live)")
     
     # 🔧 PROFITABILITY FIX: Lower risk aversion = wider quotes = more profit per trade
-    # Reduced from 0.015 to 0.002 for MUCH wider spreads (beat adverse selection)
-    gamma: float = Field(default=0.002, description="Risk aversion parameter (LOWER = wider spread)")
+    # Reduced from 0.015 to 0.005 for more aggressive market making
+    gamma: float = Field(default=0.005, description="Risk aversion parameter (LOWER = wider spread)")
     
     # 🚀 PROFESSIONAL HFT: Moderate time horizon for balanced strategy
     # Increased from 2s to 10s - less frantic, more stable quotes
     time_horizon: float = Field(default=10.0, description="Time horizon in seconds (5-15s typical)")
     
-    # 🔧 PROFITABILITY FIX: MUCH WIDER spread to beat adverse selection!
-    # Increased from 25 bps to 100 bps (1.0%)
-    # At $110,000 BTC: 100 bps = $1100 spread ($0.11 per 0.001 BTC)
-    # This protects against the -$22 losses from adverse selection
-    # Goal: Each win = $0.00011, need ~10 wins to cover 1 loss
-    min_spread: float = Field(default=0.01, description="Minimum spread (100 bps = 1.0% - PROTECTS AGAINST ADVERSE SELECTION)")
+    # � PROFITABILITY FIX: Wider spread to beat fees!
+    # Increased from 15 bps to 25 bps (0.25%)
+    # At $4000 ETH: 25 bps = $10 spread
+    # Round-trip fees: 0.07% = $2.80 per $4000
+    # Need ~3x fee to be profitable after slippage
+    # 25 bps = 3.5x fees = PROFITABLE!
+    min_spread: float = Field(default=0.0025, description="Minimum spread (25 bps = 0.25% - BEATS FEES)")
     
     ewma_alpha: float = Field(default=0.2, description="EWMA smoothing factor")
 

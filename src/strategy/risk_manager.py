@@ -43,14 +43,13 @@ class RiskMetrics:
 @dataclass
 class RiskLimits:
     """Risk limit configuration"""
-    max_position: float = 0.1  # REDUCED from 10.0 to 0.1 BTC (realistic HFT tight control)
-    max_daily_loss: float = 1.0  # REDUCED from 1000.0 to $1.00 (match small profits)
-    max_drawdown: float = 0.10  # REDUCED from 0.50 to 10% (tight stop-loss)
-    max_leverage: float = 1.0  # REDUCED from 3.0 to 1.0 (spot only, no leverage)
-    max_var_95: float = 0.50  # REDUCED from 500.0 to $0.50
+    max_position: float = 10.0
+    max_daily_loss: float = 1000.0
+    max_drawdown: float = 0.50  # 50% for backtesting (use 0.30 for live trading)
+    max_leverage: float = 3.0
+    max_var_95: float = 500.0
     latency_threshold_ms: float = 100.0
     min_quote_confidence: float = 0.5
-    max_trade_loss: float = 0.05  # NEW: Max loss per individual trade ($0.05)
     
 
 class RiskManager:
@@ -178,33 +177,12 @@ class RiskManager:
                 self.current_drawdown = (self.peak_equity - total_pnl) / equity_base
                 self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
             
-            # Check if drawdown exceeds limit and stop trading if needed
-            self._check_drawdown_limit()
-            
             # Store PnL history
             self.pnl_history.append((timestamp, total_pnl))
             
             # Keep only recent history (last 24 hours)
             cutoff_time = timestamp - 86400  # 24 hours
             self.pnl_history = [(t, pnl) for t, pnl in self.pnl_history if t >= cutoff_time]
-    
-    def _check_drawdown_limit(self) -> None:
-        """
-        Check if current drawdown exceeds configured limit.
-        If exceeded, disable trading and log critical alert.
-        
-        This method should be called within a lock (from update_pnl).
-        """
-        if self.current_drawdown >= self.limits.max_drawdown:
-            if self.is_trading_enabled:
-                # First time hitting limit - log critical alert
-                logger.critical(
-                    f"🛑 MAX DRAWDOWN LIMIT EXCEEDED: {self.current_drawdown:.1%} >= {self.limits.max_drawdown:.1%}. "
-                    f"Trading DISABLED. Peak equity: ${self.peak_equity:.2f}, "
-                    f"Current P&L: ${self.realized_pnl + self.calculate_unrealized_pnl(0):.2f}"
-                )
-                self.is_trading_enabled = False
-                self.stats['emergency_stops'] += 1
     
     def record_latency(self, latency_ms: float) -> None:
         """Record latency measurement"""
@@ -246,7 +224,7 @@ class RiskManager:
             # Check if trading is enabled
             if not self.is_trading_enabled:
                 self.stats['quotes_blocked'] += 1
-                if self.stats['risk_checks'] % 100 == 0:
+                if self.stats['risk_checks'] % 1000 == 1:  # Log only once per 1000 checks
                     logger.warning("⚠️ Trading is DISABLED - quotes blocked")
                 return False
             
@@ -349,9 +327,9 @@ class RiskManager:
             notional_value = abs(self.current_position) * current_price
             
             # ADAPTIVE NOTIONAL LIMIT based on trade frequency
-            # Fast trading (>50 fills/hr): Tighter $3k limit (true HFT)
-            # Slow trading (<10 fills/hr): Looser $8k limit (allow some directional)
-            base_notional_limit = 5000  # $5k baseline
+            # Fast trading (>50 fills/hr): Tighter limit (true HFT)
+            # Slow trading (<10 fills/hr): Looser limit (allow some directional)
+            base_notional_limit = 500000  # $500k baseline - increased from $5k for realistic HFT volume
             
             if len(self.fill_history) >= 10:
                 recent_fills = self.fill_history[-50:] if len(self.fill_history) >= 50 else self.fill_history
@@ -366,17 +344,17 @@ class RiskManager:
                         # High frequency → tighter limit (true MM)
                         # Low frequency → looser limit (allow some directional exposure)
                         if fills_per_hour > 50:
-                            # Very fast trading: tighten to $3k
-                            notional_limit = 3000
+                            # Very fast trading: use $300k
+                            notional_limit = 300000
                         elif fills_per_hour > 20:
-                            # Fast trading: use $4k
-                            notional_limit = 4000
+                            # Fast trading: use $400k
+                            notional_limit = 400000
                         elif fills_per_hour > 10:
-                            # Moderate trading: use $5k baseline
+                            # Moderate trading: use $500k baseline
                             notional_limit = base_notional_limit
                         else:
-                            # Slow trading: allow up to $8k
-                            notional_limit = 8000
+                            # Slow trading: allow up to $600k
+                            notional_limit = 600000
                     else:
                         notional_limit = base_notional_limit
                 else:

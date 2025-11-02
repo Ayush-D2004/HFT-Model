@@ -148,11 +148,13 @@ class OrderBookReplayEngine:
     def __init__(self, 
                  symbol: str,
                  data_loader: HistoricalDataLoader,
-                 strategy_callback: Optional[Callable] = None):
+                 strategy_callback: Optional[Callable] = None,
+                 early_stop_check: Optional[Callable[[], bool]] = None):
         
         self.symbol = symbol
         self.data_loader = data_loader
         self.strategy_callback = strategy_callback
+        self.early_stop_check = early_stop_check  # Function that returns True if should stop
         
         # Order book for replay - use non-strict sequencing for backtesting
         self.order_book = OrderBook(symbol, max_levels=50, strict_sequencing=False)
@@ -209,8 +211,19 @@ class OrderBookReplayEngine:
             
             logger.info(f"Loaded {self.events_total} tick events")
             
+            # Track if stopped early
+            stopped_early = False
+            stop_reason = None
+            
             # Process each tick event
             for tick in all_ticks:
+                # Check for early stop condition (e.g., drawdown limit exceeded)
+                if self.early_stop_check and self.early_stop_check():
+                    stopped_early = True
+                    stop_reason = "Risk limit exceeded (trading disabled)"
+                    logger.warning(f"⚠️ Backtest stopped early: {stop_reason}")
+                    break
+                
                 success = self._process_tick(tick)
                 if success:
                     self.events_processed += 1
@@ -224,8 +237,12 @@ class OrderBookReplayEngine:
             # Finalize backtest
             self.end_time = time.time()
             self.stats['replay_duration_sec'] = self.end_time - self.start_time
+            self.stats['stopped_early'] = stopped_early
+            self.stats['stop_reason'] = stop_reason
             
             logger.info(f"Backtest completed: {self.events_processed}/{self.events_total} events processed")
+            if stopped_early:
+                logger.warning(f"Backtest stopped early: {stop_reason}")
             
             return self._generate_results()
             

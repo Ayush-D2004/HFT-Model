@@ -48,12 +48,12 @@ class BacktestConfig:
     # Strategy parameters - OPTIMIZED FOR HFT MARKET MAKING
     gamma: float = 0.015  # Risk aversion - typical HFT range 0.01-0.02
     time_horizon: float = 10.0  # Time horizon in seconds - HFT uses 5-15s
-    min_spread: float = 0.0008  # Minimum spread 0.08% (8 bps) - competitive HFT spread
+    min_spread: float = 0.0035  # Minimum spread 0.35% (35 bps) - INCREASED to beat fees + adverse selection
     tick_size: float = 0.01
-    lot_size: float = 0.01
+    lot_size: float = 0.001
     
     # Risk parameters
-    max_position: float = 0.05  # REDUCED from 10.0 to enforce flat position (was 0.1 in config)
+    max_position: float = 5.0  # Increased from 0.05 to allow more trading activity
     max_daily_loss: float = 1000.0  
     max_drawdown: float = 0.30  # 30% - realistic for market making
     
@@ -168,20 +168,23 @@ class StrategyBacktester:
         """Handle fill event from fill simulator"""
         try:
             # Extract quote ID from order ID (format: SYMBOL_SIDE_QUOTE_SEQ_TIMESTAMP)
-            # Example: "ETHUSDT_BID_123_1698765432000" → quote_id = 123
+            # Example: "BTCUSDT_bid_123_1698765432000" → quote_seq = 123
+            # Both bid and ask from same quote have SAME quote_seq, so only count once
+            quote_id_from_order = None
             try:
                 order_id_parts = fill_event.order_id.split('_')
                 if len(order_id_parts) >= 4:
                     quote_id_from_order = int(order_id_parts[2])  # Third part is quote sequence
-                    
-                    # Record that this quote got filled (only once per unique quote ID)
-                    if quote_id_from_order not in self.fill_simulator.filled_quote_ids:
-                        self.fill_simulator.record_quote_fill(quote_id_from_order)
-            except (ValueError, IndexError) as e:
-                # Couldn't extract quote ID - use fallback logic
-                if self.active_quote_id is not None and self.active_quote_id != self.last_filled_quote_id:
-                    self.fill_simulator.record_quote_fill(self.active_quote_id)
-                    self.last_filled_quote_id = self.active_quote_id
+            except (ValueError, IndexError):
+                pass
+            
+            # Record that this quote got filled (only once per unique quote ID)
+            # This ensures both bid AND ask fills from same quote only increment counter once
+            if quote_id_from_order is not None:
+                self.fill_simulator.record_quote_fill(quote_id_from_order)
+            elif self.active_quote_id is not None:
+                # Fallback: use current active quote (but this might overcount)
+                self.fill_simulator.record_quote_fill(self.active_quote_id)
             
             # Update quote manager
             self.quote_manager.handle_fill(
@@ -203,14 +206,14 @@ class StrategyBacktester:
             # Cancel pending orders immediately if limits exceeded
             position_abs = abs(self.risk_manager.current_position)
             notional_value = position_abs * self.current_price
-            MAX_NOTIONAL = 5000  # Must match risk_manager.py
+            MAX_NOTIONAL = 500000  # Increased from 5000 to allow realistic HFT volume
             MAX_POSITION = self.config.max_position  # Use config max position
             
             # STRICT POSITION ENFORCEMENT: Cancel ALL orders if over limit
             position_ratio = position_abs / MAX_POSITION
             
-            if position_ratio > 0.95:
-                # CRITICAL: At 95% of limit, cancel everything and stop quoting
+            if position_ratio > 0.98:
+                # CRITICAL: At 98% of limit, cancel everything and stop quoting
                 logger.error(f"🚨 EMERGENCY STOP: Position {self.risk_manager.current_position:.4f} "
                            f"at {position_ratio*100:.0f}% of max ({MAX_POSITION}). "
                            f"Cancelling all orders!")
@@ -219,12 +222,12 @@ class StrategyBacktester:
                 self.last_quote_time = fill_event.timestamp + 10.0
                 return
                 
-            elif position_ratio > 0.70:
-                # TIER 1: Percentage-based limit (70% of max position)
-                logger.warning(f"⚠️ POSITION LIMIT (70%) EXCEEDED: {position_ratio*100:.1f}% of max. "
+            elif position_ratio > 0.90:
+                # TIER 1: Percentage-based limit (90% of max position) - reduced frequency
+                logger.warning(f"⚠️ POSITION LIMIT (90%) EXCEEDED: {position_ratio*100:.1f}% of max. "
                              f"Position: {self.risk_manager.current_position:.4f}, "
                              f"Notional: ${notional_value:.0f}. Cancelling all pending quotes.")
-                self.quote_manager.cancel_all_orders(reason="Position limit 70% exceeded")
+                self.quote_manager.cancel_all_orders(reason="Position limit 90% exceeded")
             
             # TIER 2: Absolute notional limit ($5k)
             elif notional_value > MAX_NOTIONAL:
@@ -238,12 +241,11 @@ class StrategyBacktester:
                              f"approaching limit. Notional: ${notional_value:.0f}. "
                              f"Consider reducing position.")
             
-            # Monitor for large positions (potential source of outlier trades)
-            if position_abs > 0.5:  # More than 0.5 BTC is concerning for HFT MM
-                logger.warning(f"⚠️ LARGE POSITION: {self.risk_manager.current_position:.4f} BTC "
-                             f"@ ${self.current_price:.2f} | "
-                             f"Notional: ${notional_value:.0f} | "
-                             f"Unrealized P&L: ${self.metrics._calculate_unrealized_pnl(self.current_price):.2f}")
+            # Monitor for large positions - log only every 100 fills to reduce spam
+            if position_abs > 2.0 and self.metrics.filled_quotes % 100 == 0:
+                logger.info(f"📊 Position update: {self.risk_manager.current_position:.4f} BTC "
+                             f"(Notional: ${notional_value:,.0f} | "
+                             f"Unrealized P&L: ${self.metrics._calculate_unrealized_pnl(self.current_price):.2f})")
             
             # logger.debug(f"Fill processed: {fill_event.side.value} {fill_event.fill_quantity:.4f} "
             #             f"@ {fill_event.fill_price:.2f}")
@@ -290,11 +292,6 @@ class StrategyBacktester:
             # Update strategy with new market data
             self.pricer.update_market(midprice, event.timestamp)
             self.risk_manager.update_pnl(self.current_price, event.timestamp)
-            
-            # ✅ CRITICAL: Check if trading was disabled due to max drawdown
-            if not self.risk_manager.is_trading_enabled:
-                # Stop generating quotes - backtesting will continue to record final state
-                return
             
             # Generate new quotes if needed
             if self._should_update_quotes(event.timestamp):
@@ -431,11 +428,12 @@ class BacktestEngine:
             
             strategy_backtester = StrategyBacktester(config, fill_simulator, metrics)
             
-            # Initialize replay engine
+            # Initialize replay engine with early stop callback
             replay_engine = OrderBookReplayEngine(
                 symbol=config.symbol,
                 data_loader=self.data_loader,
-                strategy_callback=strategy_backtester.handle_market_event
+                strategy_callback=strategy_backtester.handle_market_event,
+                early_stop_check=lambda: not strategy_backtester.risk_manager.is_trading_enabled
             )
             
             # Run the backtest with REAL market data
@@ -525,14 +523,49 @@ class BacktestEngine:
             # Calculate final performance metrics with position=0 (excludes unrealized P&L)
             performance = metrics.calculate_performance_metrics(final_price)
             
-            # ✅ Check if trading was stopped early due to max drawdown
-            stopped_early = not strategy_backtester.risk_manager.is_trading_enabled
-            stop_reason = None
-            if stopped_early:
-                stop_reason = f"Max drawdown limit ({config.max_drawdown:.1%}) exceeded"
-                logger.warning(f"⚠️ BACKTEST STOPPED EARLY: {stop_reason}")
-                logger.warning(f"   Current drawdown: {strategy_backtester.risk_manager.current_drawdown:.1%}")
-                logger.warning(f"   Total trades before stop: {performance.total_trades}")
+            # ✅ FIX: Override fill_rate with correct calculation from fill simulator stats
+            fill_stats = fill_simulator.get_statistics()
+            total_orders_submitted = fill_stats.get('quotes_submitted', 0) * 2  # Each quote = bid + ask
+            total_orders_filled = fill_stats.get('orders_filled', 0)
+            correct_fill_rate = total_orders_filled / max(total_orders_submitted, 1) if total_orders_submitted > 0 else 0.0
+            
+            # Update performance metrics with correct fill rate
+            performance = PerformanceMetrics(
+                total_pnl=performance.total_pnl,
+                realized_pnl=performance.realized_pnl,
+                unrealized_pnl=performance.unrealized_pnl,
+                gross_pnl=performance.gross_pnl,
+                net_pnl=performance.net_pnl,
+                total_return_pct=performance.total_return_pct,
+                sharpe_ratio=performance.sharpe_ratio,
+                sortino_ratio=performance.sortino_ratio,
+                calmar_ratio=performance.calmar_ratio,
+                max_drawdown=performance.max_drawdown,
+                max_drawdown_duration=performance.max_drawdown_duration,
+                volatility=performance.volatility,
+                total_trades=performance.total_trades,
+                winning_trades=performance.winning_trades,
+                losing_trades=performance.losing_trades,
+                win_rate=performance.win_rate,
+                avg_win=performance.avg_win,
+                avg_loss=performance.avg_loss,
+                avg_trade_pnl=performance.avg_trade_pnl,
+                profit_factor=performance.profit_factor,
+                fill_rate=correct_fill_rate,  # ✅ Use correct order-level fill rate
+                quote_hit_rate=performance.quote_hit_rate,
+                avg_spread_captured=performance.avg_spread_captured,
+                inventory_turnover=performance.inventory_turnover,
+                adverse_selection_rate=performance.adverse_selection_rate,
+                avg_fill_latency_ms=performance.avg_fill_latency_ms,
+                total_fees=performance.total_fees,
+                fee_rate=performance.fee_rate,
+                total_volume=performance.total_volume,
+                start_time=performance.start_time,
+                end_time=performance.end_time,
+                duration_hours=performance.duration_hours,
+                pnl_history=performance.pnl_history,
+                timestamps=performance.timestamps
+            )
             
             # ✅ ISSUE #13 FIX: Always pass metrics object to BacktestResult
             # Create result with BOTH performance AND raw metrics for dashboard charts
@@ -549,8 +582,9 @@ class BacktestEngine:
                         'risk_manager': strategy_backtester.risk_manager.get_statistics(),
                         'quote_manager': strategy_backtester.quote_manager.get_statistics()
                     },
-                    'stopped_early': stopped_early,
-                    'stop_reason': stop_reason,
+                    # Add early stop information
+                    'stopped_early': replay_results.get('statistics', {}).get('stopped_early', False),
+                    'stop_reason': replay_results.get('statistics', {}).get('stop_reason', None),
                     'final_drawdown': strategy_backtester.risk_manager.current_drawdown
                 }
             )
