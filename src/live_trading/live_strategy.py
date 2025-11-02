@@ -97,7 +97,7 @@ class LiveAvellanedaStoikov:
             self.last_spread = spread
             
             # Update volatility estimate
-            self.current_volatility = self.pricer.instantaneous_sigma()
+            self.current_volatility = self.pricer.get_instantaneous_volatility()
             
             # Check if we should generate new quotes
             if self._should_update_quotes():
@@ -226,27 +226,33 @@ class LiveAvellanedaStoikov:
             
             # self.logger.debug(f"Generating quotes with midprice={self.current_midprice}")
             
-            # Get optimal quotes from strategy
-            bid_price, ask_price = self.pricer.compute_quotes(
+            # Create quote parameters
+            from src.strategy import QuoteParameters
+            params = QuoteParameters(
                 gamma=self.gamma,
                 T=self.time_horizon,
-                midprice=self.current_midprice,
+                k=None,  # Let strategy estimate k
                 min_spread=self.min_spread
             )
             
-            # Use fixed lot size for simplicity in testing
-            quote_size = self.lot_size
+            # Get optimal quotes from strategy (returns MarketQuote object)
+            market_quote = self.pricer.compute_quotes(
+                params=params,
+                midprice=self.current_midprice
+            )
             
+            # Convert MarketQuote to dictionary format
             quotes = {
                 'symbol': self.symbol,
-                'timestamp': time.time(),
-                'bid': bid_price,
-                'ask': ask_price,
-                'bid_size': quote_size,
-                'ask_size': quote_size,
+                'timestamp': market_quote.timestamp,
+                'bid': market_quote.bid_price,
+                'ask': market_quote.ask_price,
+                'bid_size': market_quote.bid_size,
+                'ask_size': market_quote.ask_size,
                 'midprice': self.current_midprice,
-                'spread': ask_price - bid_price,
-                'volatility': self.current_volatility or 0.0
+                'spread': market_quote.spread,
+                'volatility': self.current_volatility or 0.0,
+                'reservation_price': market_quote.reservation_price
             }
             
             # self.logger.info(f"Generated quotes: BID={bid_price:.4f}({quote_size}) ASK={ask_price:.4f}({quote_size})")

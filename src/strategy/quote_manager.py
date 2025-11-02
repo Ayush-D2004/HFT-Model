@@ -621,7 +621,7 @@ if __name__ == "__main__":
     from .risk_manager import RiskManager, RiskLimits
     
     # Initialize components
-    pricer = AvellanedaStoikovPricer(tick_size=0.01, lot_size=0.001)
+    pricer = AvellanedaStoikovPricer(tick_size=0.01, lot_size=0.01)
     risk_manager = RiskManager(RiskLimits())
     
     def mock_order_callback(order_data):

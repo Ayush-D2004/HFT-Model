@@ -50,7 +50,7 @@ class BacktestConfig:
     time_horizon: float = 10.0  # Time horizon in seconds - HFT uses 5-15s
     min_spread: float = 0.0035  # Minimum spread 0.35% (35 bps) - INCREASED to beat fees + adverse selection
     tick_size: float = 0.01
-    lot_size: float = 0.001
+    lot_size: float = 0.01
     
     # Risk parameters
     max_position: float = 0.05  # REDUCED from 10.0 to enforce flat position (was 0.1 in config)
@@ -291,6 +291,11 @@ class StrategyBacktester:
             self.pricer.update_market(midprice, event.timestamp)
             self.risk_manager.update_pnl(self.current_price, event.timestamp)
             
+            # ✅ CRITICAL: Check if trading was disabled due to max drawdown
+            if not self.risk_manager.is_trading_enabled:
+                # Stop generating quotes - backtesting will continue to record final state
+                return
+            
             # Generate new quotes if needed
             if self._should_update_quotes(event.timestamp):
                 self._update_quotes(event.timestamp)
@@ -520,6 +525,15 @@ class BacktestEngine:
             # Calculate final performance metrics with position=0 (excludes unrealized P&L)
             performance = metrics.calculate_performance_metrics(final_price)
             
+            # ✅ Check if trading was stopped early due to max drawdown
+            stopped_early = not strategy_backtester.risk_manager.is_trading_enabled
+            stop_reason = None
+            if stopped_early:
+                stop_reason = f"Max drawdown limit ({config.max_drawdown:.1%}) exceeded"
+                logger.warning(f"⚠️ BACKTEST STOPPED EARLY: {stop_reason}")
+                logger.warning(f"   Current drawdown: {strategy_backtester.risk_manager.current_drawdown:.1%}")
+                logger.warning(f"   Total trades before stop: {performance.total_trades}")
+            
             # ✅ ISSUE #13 FIX: Always pass metrics object to BacktestResult
             # Create result with BOTH performance AND raw metrics for dashboard charts
             result = BacktestResult(
@@ -534,7 +548,10 @@ class BacktestEngine:
                         'pricer': strategy_backtester.pricer.get_statistics(),
                         'risk_manager': strategy_backtester.risk_manager.get_statistics(),
                         'quote_manager': strategy_backtester.quote_manager.get_statistics()
-                    }
+                    },
+                    'stopped_early': stopped_early,
+                    'stop_reason': stop_reason,
+                    'final_drawdown': strategy_backtester.risk_manager.current_drawdown
                 }
             )
             

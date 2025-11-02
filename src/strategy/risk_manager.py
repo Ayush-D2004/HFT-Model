@@ -43,13 +43,14 @@ class RiskMetrics:
 @dataclass
 class RiskLimits:
     """Risk limit configuration"""
-    max_position: float = 10.0
-    max_daily_loss: float = 1000.0
-    max_drawdown: float = 0.50  # 50% for backtesting (use 0.30 for live trading)
-    max_leverage: float = 3.0
-    max_var_95: float = 500.0
+    max_position: float = 0.1  # REDUCED from 10.0 to 0.1 BTC (realistic HFT tight control)
+    max_daily_loss: float = 1.0  # REDUCED from 1000.0 to $1.00 (match small profits)
+    max_drawdown: float = 0.10  # REDUCED from 0.50 to 10% (tight stop-loss)
+    max_leverage: float = 1.0  # REDUCED from 3.0 to 1.0 (spot only, no leverage)
+    max_var_95: float = 0.50  # REDUCED from 500.0 to $0.50
     latency_threshold_ms: float = 100.0
     min_quote_confidence: float = 0.5
+    max_trade_loss: float = 0.05  # NEW: Max loss per individual trade ($0.05)
     
 
 class RiskManager:
@@ -177,12 +178,33 @@ class RiskManager:
                 self.current_drawdown = (self.peak_equity - total_pnl) / equity_base
                 self.max_drawdown = max(self.max_drawdown, self.current_drawdown)
             
+            # Check if drawdown exceeds limit and stop trading if needed
+            self._check_drawdown_limit()
+            
             # Store PnL history
             self.pnl_history.append((timestamp, total_pnl))
             
             # Keep only recent history (last 24 hours)
             cutoff_time = timestamp - 86400  # 24 hours
             self.pnl_history = [(t, pnl) for t, pnl in self.pnl_history if t >= cutoff_time]
+    
+    def _check_drawdown_limit(self) -> None:
+        """
+        Check if current drawdown exceeds configured limit.
+        If exceeded, disable trading and log critical alert.
+        
+        This method should be called within a lock (from update_pnl).
+        """
+        if self.current_drawdown >= self.limits.max_drawdown:
+            if self.is_trading_enabled:
+                # First time hitting limit - log critical alert
+                logger.critical(
+                    f"🛑 MAX DRAWDOWN LIMIT EXCEEDED: {self.current_drawdown:.1%} >= {self.limits.max_drawdown:.1%}. "
+                    f"Trading DISABLED. Peak equity: ${self.peak_equity:.2f}, "
+                    f"Current P&L: ${self.realized_pnl + self.calculate_unrealized_pnl(0):.2f}"
+                )
+                self.is_trading_enabled = False
+                self.stats['emergency_stops'] += 1
     
     def record_latency(self, latency_ms: float) -> None:
         """Record latency measurement"""

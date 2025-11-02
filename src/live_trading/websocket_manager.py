@@ -253,5 +253,5 @@ class BinanceWebSocketManager:
             'last_message_time': self.last_message_time,
             'reconnect_attempts': self.reconnect_attempts,
             'symbol': self.symbol.upper(),
-            'streams': self.streams
+            'stream_url': self.stream_url
         }

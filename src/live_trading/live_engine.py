@@ -111,32 +111,30 @@ class LiveTradingEngine:
             raise
     
     async def start_trading(self):
-        """Start live trading"""
+        """Start live trading - simplified for direct processing"""
         if self.is_running:
             self.logger.warning("Trading already running")
             return
         
         try:
-            self.logger.info("Starting live trading...")
+            self.logger.info("🚀 Starting live trading with DIRECT processing (HFT mode)...")
             self.is_running = True
             self.start_time = datetime.now()
             
-            # Start WebSocket connection
+            # Start WebSocket connection (this handles everything via callbacks)
             await self.websocket_manager.connect()
             
-            # Start processing loops as background tasks and keep references
-            self.logger.info("Starting background processing tasks...")
-            market_data_task = asyncio.create_task(self._market_data_processor())
-            order_task = asyncio.create_task(self._order_processor()) 
+            # Start only performance updater as background task
+            self.logger.info("Starting performance updater...")
             performance_task = asyncio.create_task(self._performance_updater())
             
-            self.logger.info("Live trading started successfully - all processors running")
+            self.logger.info("✅ Live trading started - processing market data directly via callbacks")
             
-            # Keep the main function running to maintain WebSocket connection and tasks
+            # Keep running and wait for performance task
             try:
-                await asyncio.gather(market_data_task, order_task, performance_task)
+                await performance_task
             except Exception as e:
-                self.logger.error(f"Error in background tasks: {e}")
+                self.logger.error(f"Error in performance updater: {e}")
             
         except Exception as e:
             self.logger.error(f"Error starting live trading: {e}")
@@ -145,7 +143,7 @@ class LiveTradingEngine:
             raise
     
     def stop_trading(self):
-        """Stop live trading"""
+        """Stop live trading (synchronous wrapper)"""
         if not self.is_running:
             self.logger.warning("Trading not running")
             return
@@ -153,9 +151,20 @@ class LiveTradingEngine:
         self.logger.info("Stopping live trading...")
         self.is_running = False
         
-        # Disconnect WebSocket
+        # Disconnect WebSocket - handle both sync and async contexts
         if self.websocket_manager:
-            asyncio.create_task(self.websocket_manager.disconnect())
+            try:
+                # Try to get running loop
+                loop = asyncio.get_running_loop()
+                # If we're in an async context, create a task
+                asyncio.create_task(self.websocket_manager.disconnect())
+            except RuntimeError:
+                # No running loop - we're in sync context (Streamlit)
+                # Run disconnect in a new event loop
+                try:
+                    asyncio.run(self.websocket_manager.disconnect())
+                except Exception as e:
+                    self.logger.warning(f"Error disconnecting WebSocket: {e}")
         
         # Save final state
         self._save_trading_state()
@@ -170,24 +179,31 @@ class LiveTradingEngine:
     
     async def _market_data_processor(self):
         """Process incoming market data and generate trading signals"""
-        self.logger.info("Market data processor started")
+        self.logger.info("🚀 Market data processor started - will process queued data")
         processed_count = 0
+        last_log_time = time.time()
         
         while self.is_running:
             try:
+                # Log processor status every 5 seconds
+                if time.time() - last_log_time > 5:
+                    queue_size = self.market_data_queue.qsize()
+                    self.logger.info(f"📊 Processor alive: processed={processed_count}, queue_size={queue_size}, running={self.is_running}")
+                    last_log_time = time.time()
+                
                 if not self.market_data_queue.empty():
                     market_data = self.market_data_queue.get_nowait()
                     processed_count += 1
                     
                     # Log every 10th processing for monitoring
                     if processed_count % 10 == 0:
-                        self.logger.info(f"Processing market data #{processed_count}: midprice={market_data.get('midprice', 'N/A')}")
+                        self.logger.info(f"✅ Processing market data #{processed_count}: midprice={market_data.get('midprice', 'N/A')}")
                     
                     # Update strategy with new market data
                     quotes = self.strategy.process_market_data(market_data)
                     
                     if quotes:
-                        self.logger.info(f"Strategy generated quotes: BID={quotes.get('bid', 'N/A'):.4f} ASK={quotes.get('ask', 'N/A'):.4f}")
+                        self.logger.info(f"💰 Strategy generated quotes: BID={quotes.get('bid', 'N/A'):.4f} ASK={quotes.get('ask', 'N/A'):.4f}")
                         # Add to order queue for execution
                         self.order_queue.put({
                             'type': 'quotes',
@@ -237,8 +253,11 @@ class LiveTradingEngine:
     
     async def _performance_updater(self):
         """Update performance metrics periodically"""
+        update_count = 0
         while self.is_running:
             try:
+                update_count += 1
+                
                 # Calculate current performance
                 performance_data = self.performance_tracker.get_current_performance()
                 
@@ -248,6 +267,10 @@ class LiveTradingEngine:
                 
                 performance_data['trade_count'] = self.trade_count
                 performance_data['is_connected'] = self.is_connected
+                
+                # Log every 5 updates
+                if update_count % 5 == 0:
+                    self.logger.info(f"📊 Performance update #{update_count}: trades={self.trade_count}, callbacks={len(self.callbacks.get('on_performance_update', []))}")
                 
                 # Emit performance update event
                 self._emit_event('on_performance_update', performance_data)
@@ -259,22 +282,50 @@ class LiveTradingEngine:
                 await asyncio.sleep(5.0)
     
     def _on_orderbook_update(self, orderbook_data: Dict):
-        """Handle orderbook updates from WebSocket"""
+        """Handle orderbook updates from WebSocket - DIRECT PROCESSING (HFT style)"""
         try:
-            # Add to market data queue
-            if not self.market_data_queue.full():
-                self.market_data_queue.put(orderbook_data)
-                # Only log every 50th update to reduce noise
-                if not hasattr(self, '_update_count'):
-                    self._update_count = 0
-                self._update_count += 1
-                if self._update_count % 50 == 0:
-                    self.logger.debug(f"Added market data to queue: midprice={orderbook_data.get('midprice', 'N/A')} (update #{self._update_count})")
-            else:
-                self.logger.warning("Market data queue full, dropping update")
+            if not self.is_running:
+                return
+            
+            # Process IMMEDIATELY - no queue for HFT
+            # Update strategy with new market data
+            quotes = self.strategy.process_market_data(orderbook_data)
+            
+            if quotes:
+                # Execute immediately (simulate for now)
+                execution_result = self._simulate_order_execution({
+                    'type': 'quotes',
+                    'data': quotes,
+                    'timestamp': time.time()
+                })
                 
+                if execution_result:
+                    # Update performance tracker
+                    self.performance_tracker.add_trade(execution_result)
+                    self.trade_count += 1
+                    
+                    # Emit trade execution event
+                    self._emit_event('on_trade_executed', execution_result)
+            
+            # Emit market data event for dashboard (every 50 updates)
+            if not hasattr(self, '_update_count'):
+                self._update_count = 0
+            self._update_count += 1
+            
+            if self._update_count % 50 == 0:
+                self._emit_event('on_market_data', {
+                    'timestamp': orderbook_data.get('timestamp'),
+                    'symbol': orderbook_data.get('symbol'),
+                    'best_bid': orderbook_data.get('best_bid'),
+                    'best_ask': orderbook_data.get('best_ask'),
+                    'spread': orderbook_data.get('spread'),
+                    'midprice': orderbook_data.get('midprice'),
+                    'strategy_quotes': quotes
+                })
+                self.logger.debug(f"📊 Processed update #{self._update_count}: mid={orderbook_data.get('midprice', 'N/A'):.2f}, trades={self.trade_count}")
+        
         except Exception as e:
-            self.logger.error(f"Error handling orderbook update: {e}")
+            self.logger.error(f"Error processing orderbook update: {e}")
     
     def _on_trade_update(self, trade_data: Dict):
         """Handle trade updates from WebSocket"""
@@ -297,17 +348,59 @@ class LiveTradingEngine:
         })
     
     def _simulate_order_execution(self, order_data: Dict) -> Optional[Dict]:
-        """Simulate order execution (replace with real execution)"""
+        """
+        Simulate order execution with INTELLIGENT INVENTORY MANAGEMENT.
+        
+        Real market making: Both bid and ask quotes are posted simultaneously.
+        Fills happen based on market aggressor flow and inventory position.
+        
+        Professional HFT behavior:
+        - When flat (inventory=0): Equal probability for buy/sell
+        - When long (inventory>0): Favor SELL fills to reduce inventory
+        - When short (inventory<0): Favor BUY fills to reduce inventory
+        
+        This minimizes zero PnL trades by ensuring balanced buy/sell execution.
+        """
         try:
             if order_data['type'] == 'quotes':
                 quotes = order_data['data']
                 
+                # Track inventory (net position) for intelligent fill simulation
+                if not hasattr(self, '_inventory'):
+                    self._inventory = 0.0  # Net position in BTC
+                
                 # Very aggressive fill simulation for HFT - 80% fill probability  
                 import random
                 if random.random() < 0.8:  # 80% fill probability for HFT simulation
-                    side = random.choice(['buy', 'sell'])
-                    price = quotes['bid'] if side == 'buy' else quotes['ask']
-                    quantity = quotes.get('bid_size' if side == 'buy' else 'ask_size', self.config.get('lot_size', 0.001))
+                    
+                    # INTELLIGENT SIDE SELECTION based on inventory
+                    # Market makers prefer to reduce inventory (mean reversion)
+                    
+                    if abs(self._inventory) < 0.001:  # Flat position (< 0.001 BTC)
+                        # Equal probability when neutral
+                        side = random.choice(['buy', 'sell'])
+                    elif self._inventory > 0:  # Long position
+                        # Favor SELL to reduce inventory (70% sell, 30% buy)
+                        side = 'sell' if random.random() < 0.7 else 'buy'
+                    else:  # Short position
+                        # Favor BUY to reduce inventory (70% buy, 30% sell)
+                        side = 'buy' if random.random() < 0.7 else 'sell'
+                    
+                    # MARKET MAKING: You provide liquidity at YOUR quotes
+                    # Your strategy generates bid/ask prices
+                    # When filled:
+                    #   - BUY filled at YOUR BID (you buy at your bid price)
+                    #   - SELL filled at YOUR ASK (you sell at your ask price)
+                    # Profit = YOUR ASK - YOUR BID (the spread you set)
+                    
+                    if side == 'buy':
+                        price = quotes['bid']  # You buy at YOUR bid price
+                        quantity = quotes.get('bid_size', self.config.get('lot_size', 0.01))
+                        self._inventory += quantity  # Increase inventory
+                    else:  # sell
+                        price = quotes['ask']  # You sell at YOUR ask price
+                        quantity = quotes.get('ask_size', self.config.get('lot_size', 0.01))
+                        self._inventory -= quantity  # Decrease inventory
                     
                     execution_result = {
                         'timestamp': time.time(),
@@ -316,10 +409,22 @@ class LiveTradingEngine:
                         'quantity': quantity,
                         'value': price * quantity,
                         'type': 'market_making',
-                        'latency_ms': random.uniform(0.1, 2.0)  # Simulate HFT latency
+                        'latency_ms': random.uniform(0.1, 2.0),  # Simulate HFT latency
+                        'spread': quotes.get('spread', quotes['ask'] - quotes['bid']),  # Your spread
+                        'inventory': self._inventory  # Track position
                     }
                     
-                    self.logger.info(f"🔥 HFT EXECUTION: {side.upper()} {quantity} @ {price:.4f} (${price*quantity:.2f})")
+                    # Only log every 100th execution to reduce spam
+                    if not hasattr(self, '_exec_count'):
+                        self._exec_count = 0
+                    self._exec_count += 1
+                    if self._exec_count == 1:
+                        spread = quotes.get('spread', quotes['ask'] - quotes['bid'])
+                        self.logger.info(f"🎯 FIRST ORDER: {side.upper()} {quantity} @ ${price:.2f} | Spread: ${spread:.2f} | Inventory: {self._inventory:.6f}")
+                    elif self._exec_count % 100 == 0:
+                        spread = quotes.get('spread', quotes['ask'] - quotes['bid'])
+                        self.logger.info(f"📊 ORDER #{self._exec_count}: {side.upper()} @ ${price:.2f} | Spread: ${spread:.2f} | Inventory: {self._inventory:.6f}")
+                    
                     return execution_result
             
             return None
