@@ -93,7 +93,9 @@ class BacktestMetrics:
         
         # Core tracking
         self.fill_events: List[FillEvent] = []
-        self.pnl_series: List[Tuple[float, float]] = []  # (timestamp, pnl)
+        self.pnl_series: List[Tuple[float, float]] = []  # (timestamp, total_pnl)
+        self.realized_pnl_series: List[Tuple[float, float]] = []  # (timestamp, realized_pnl)
+        self.unrealized_pnl_series: List[Tuple[float, float]] = []  # (timestamp, unrealized_pnl)
         self.position_series: List[Tuple[float, float]] = []  # (timestamp, position)
         self.quote_events: List[Dict] = []
         
@@ -213,10 +215,12 @@ class BacktestMetrics:
                 spread_capture = abs(fill_event.fill_price - current_price)
                 self.spread_captures.append(spread_capture)
             
-            # Update PnL series
+            # Update PnL series (all three: total, realized, unrealized)
             unrealized_pnl = self._calculate_unrealized_pnl(current_price)
             total_pnl = self.realized_pnl + unrealized_pnl
             self.pnl_series.append((fill_event.timestamp, total_pnl))
+            self.realized_pnl_series.append((fill_event.timestamp, self.realized_pnl))
+            self.unrealized_pnl_series.append((fill_event.timestamp, unrealized_pnl))
             self.position_series.append((fill_event.timestamp, self.current_position))
             
             # Invalidate cache
@@ -310,6 +314,8 @@ class BacktestMetrics:
         # Only add if time has progressed
         if not self.pnl_series or timestamp > self.pnl_series[-1][0]:
             self.pnl_series.append((timestamp, total_pnl))
+            self.realized_pnl_series.append((timestamp, self.realized_pnl))
+            self.unrealized_pnl_series.append((timestamp, unrealized_pnl))
             self.position_series.append((timestamp, self.current_position))
     
     def calculate_performance_metrics(self, current_price: float) -> PerformanceMetrics:
@@ -437,7 +443,12 @@ class BacktestMetrics:
             
             # Fill and execution metrics
             total_fills = len(self.fill_events)
-            fill_rate = self.quote_hits / max(self.quote_updates, 1)
+            # ✅ FIX: Calculate fill rate as percentage of individual orders filled
+            # This matches the industry-standard definition used in HFT
+            # fill_rate represents: "What % of my orders get filled?"
+            # Note: quote_hits/quote_updates was measuring fills per market update (different concept)
+            # We'll keep that as quote_hit_rate for internal tracking
+            fill_rate = 0.0  # Will be set from fill simulator stats in backtest_engine
             quote_hit_rate = self.quote_hits / max(self.quote_updates, 1)
             
             avg_fill_latency = np.mean(self.fill_latencies) if self.fill_latencies else 0.0

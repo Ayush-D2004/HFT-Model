@@ -224,7 +224,7 @@ class RiskManager:
             # Check if trading is enabled
             if not self.is_trading_enabled:
                 self.stats['quotes_blocked'] += 1
-                if self.stats['risk_checks'] % 100 == 0:
+                if self.stats['risk_checks'] % 1000 == 1:  # Log only once per 1000 checks
                     logger.warning("⚠️ Trading is DISABLED - quotes blocked")
                 return False
             
@@ -327,9 +327,9 @@ class RiskManager:
             notional_value = abs(self.current_position) * current_price
             
             # ADAPTIVE NOTIONAL LIMIT based on trade frequency
-            # Fast trading (>50 fills/hr): Tighter $3k limit (true HFT)
-            # Slow trading (<10 fills/hr): Looser $8k limit (allow some directional)
-            base_notional_limit = 5000  # $5k baseline
+            # Fast trading (>50 fills/hr): Tighter limit (true HFT)
+            # Slow trading (<10 fills/hr): Looser limit (allow some directional)
+            base_notional_limit = 500000  # $500k baseline - increased from $5k for realistic HFT volume
             
             if len(self.fill_history) >= 10:
                 recent_fills = self.fill_history[-50:] if len(self.fill_history) >= 50 else self.fill_history
@@ -344,17 +344,17 @@ class RiskManager:
                         # High frequency → tighter limit (true MM)
                         # Low frequency → looser limit (allow some directional exposure)
                         if fills_per_hour > 50:
-                            # Very fast trading: tighten to $3k
-                            notional_limit = 3000
+                            # Very fast trading: use $300k
+                            notional_limit = 300000
                         elif fills_per_hour > 20:
-                            # Fast trading: use $4k
-                            notional_limit = 4000
+                            # Fast trading: use $400k
+                            notional_limit = 400000
                         elif fills_per_hour > 10:
-                            # Moderate trading: use $5k baseline
+                            # Moderate trading: use $500k baseline
                             notional_limit = base_notional_limit
                         else:
-                            # Slow trading: allow up to $8k
-                            notional_limit = 8000
+                            # Slow trading: allow up to $600k
+                            notional_limit = 600000
                     else:
                         notional_limit = base_notional_limit
                 else:

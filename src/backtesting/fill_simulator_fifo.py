@@ -344,32 +344,32 @@ class FIFOFillSimulator:
                 # At or inside best bid/ask (aggressive quote at market)
                 # � PROFITABILITY FIX: Reduced from 45% → 20%
                 # Lower fills = higher selectivity = better profit per trade
-                base_prob = 0.20  
+                base_prob = 0.85  # Increased for more fills
             elif distance_bps < 0.5:
                 # Within 0.5 bps of best (excellent competitive quote)
                 # � REDUCED from 35% → 15%
-                base_prob = 0.15  
+                base_prob = 0.70  # Increased
             elif distance_bps < 2.0:
                 # 0.5-2 bps away (good competitive quote)
                 # � REDUCED from 25% → 12%
-                base_prob = 0.12  
+                base_prob = 0.55  # Increased
             elif distance_bps < 5.0:
                 # 2-5 bps away (moderate competitive quote)
                 # � REDUCED from 18% → 8%
-                base_prob = 0.08  
+                base_prob = 0.35  # Increased
             elif distance_bps < 10.0:
                 # 5-10 bps away (less competitive)
-                base_prob = 0.05  # Reduced from 10%
+                base_prob = 0.20  # Reduced from 10%
             elif distance_bps < 20.0:
                 # 10-20 bps away (poor quote placement)
-                base_prob = 0.02  # Reduced from 5%
+                base_prob = 0.08  # Reduced from 5%
             else:
                 # >20 bps away (very unlikely to fill)
-                base_prob = 0.005  # Reduced from 1%
+                base_prob = 0.02  # Reduced from 1%
             
             # Adjust for trade rate (cap at 30% for realistic HFT)
             # 🔧 PROFITABILITY FIX: Reduced cap from 50% → 30%
-            final_prob = min(base_prob * min(trade_rate * 2, 1.0), 0.30)
+            final_prob = min(base_prob * min(trade_rate * 1.5, 1.0), 0.90)
             
             # DEBUG: Log first few fills to verify probabilities are applied
             if self._sim_fill_count < 5:

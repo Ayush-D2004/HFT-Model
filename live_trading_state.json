@@ -1,0 +1,38 @@
+{
+  "timestamp": "2025-11-02T13:23:06.502984",
+  "runtime_seconds": 22.126106,
+  "trade_count": 173,
+  "performance": {
+    "timestamp": 1762069986.5029845,
+    "runtime_hours": 0.006170195937156678,
+    "initial_balance": 10000.0,
+    "current_balance": 10028.791864614992,
+    "total_pnl": 28.79186461499997,
+    "total_return_pct": 0.28791864614991936,
+    "pnl_1h": 0.0,
+    "pnl_24h": 0.0,
+    "max_drawdown": 0.0,
+    "max_drawdown_pct": 0.0,
+    "peak_balance": 10028.791864614992,
+    "sharpe_1h": 0.0,
+    "sharpe_24h": 0.0,
+    "total_trades": 173,
+    "winning_trades": 173,
+    "losing_trades": 0,
+    "win_rate": 1.0,
+    "avg_trade_pnl": 0.16642696309248536,
+    "total_volume": 191945.76409999983,
+    "total_fees": 19.194576410000003,
+    "trades_per_hour": 10380.0,
+    "pnl_history": [],
+    "balance_history": []
+  },
+  "config": {
+    "symbol": "BTCUSDT",
+    "tick_size": 0.01,
+    "lot_size": 0.01,
+    "gamma": 0.015,
+    "time_horizon": 10,
+    "initial_balance": 10000.0
+  }
+}
