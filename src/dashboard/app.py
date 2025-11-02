@@ -269,11 +269,6 @@ def display_backtest_results(results):
                     <li><b>Total Volume:</b> ${perf.total_volume:,.0f}</li>
                 </ul>
                 <p style="margin: 10px 0 0 0; padding: 10px; background-color: rgba(255,255,255,0.7); border-radius: 5px;">
-                <b>🎯 Bottom Line:</b> This is a <b>professional-grade HFT market making strategy</b>. 
-                The results show realistic profitability with controlled risk. Your {perf.win_rate:.0%} win rate 
-                and ${perf.avg_trade_pnl:.2f} avg trade are typical for institutional market makers. 
-                {f"Negative Sharpe ratio ({perf.sharpe_ratio:.2f}) indicates drawdown volatility during the test period - this is normal for market making strategies during trending markets." if perf.sharpe_ratio < 0 else f"Sharpe ratio of {perf.sharpe_ratio:.2f} shows good risk-adjusted returns."}
-                </p>
                 </div>
                 """, unsafe_allow_html=True)
         
