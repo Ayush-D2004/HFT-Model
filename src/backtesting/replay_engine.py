@@ -57,26 +57,42 @@ class HistoricalDataLoader:
     def load_binance_depth_data(self, 
                                symbol: str, 
                                start_date: str, 
-                               end_date: str) -> Iterator[TickData]:
+                               end_date: str,
+                               interval: str = '1m') -> Iterator[TickData]:
         """
         Load REAL Binance market data from Binance API.
         Fetches actual historical kline data and generates realistic order book snapshots.
+        
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+            start_date: Start date string (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+            end_date: End date string (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+            interval: Data interval (1s, 1m, 5m, etc.)
         """
         try:
-            logger.info(f"Fetching REAL market data from Binance API for {symbol}")
+            logger.info(f"Fetching REAL market data from Binance API for {symbol} ({interval} interval)")
             
-            # Convert to datetime objects
-            start_dt = pd.to_datetime(start_date).replace(tzinfo=timezone.utc) 
-            end_dt = pd.to_datetime(end_date).replace(tzinfo=timezone.utc)
+            # Parse dates - handle both date-only and datetime formats
+            if len(start_date) <= 10:  # Date only (YYYY-MM-DD)
+                start_dt = pd.to_datetime(start_date).replace(tzinfo=timezone.utc)
+                end_dt = pd.to_datetime(end_date).replace(tzinfo=timezone.utc)
+            else:  # Datetime (YYYY-MM-DD HH:MM:SS)
+                start_dt = pd.to_datetime(start_date).replace(tzinfo=timezone.utc)
+                end_dt = pd.to_datetime(end_date).replace(tzinfo=timezone.utc)
             
-            # Fetch real kline data from Binance
-            kline_data = self.binance_fetcher.get_kline_data(symbol, start_dt, end_dt, '1m')
+            # Fetch real kline data from Binance with specified interval
+            kline_data = self.binance_fetcher.get_kline_data(symbol, start_dt, end_dt, interval)
             
             if kline_data.empty:
                 logger.error(f"No real market data available from Binance for {symbol} in specified period")
                 return
             
-            logger.info(f"Retrieved {len(kline_data)} minutes of real market data from Binance")
+            # Log data size
+            if interval == '1s':
+                logger.warning(f"⚡ Retrieved {len(kline_data):,} SECONDS of high-frequency data from Binance")
+                logger.warning(f"   Processing {len(kline_data):,} data points may take time...")
+            else:
+                logger.info(f"Retrieved {len(kline_data)} {interval} candles of real market data from Binance")
             
             # Generate realistic order book snapshots from real kline data
             order_book_updates = self.binance_fetcher.simulate_order_book_from_klines(kline_data)
@@ -184,21 +200,28 @@ class OrderBookReplayEngine:
     
     def run_backtest(self, 
                     start_date: str,
-                    end_date: str, 
+                    end_date: str,
+                    interval: str = '1m',
                     replay_speed: float = 1.0) -> Dict[str, Any]:
         """
         Run complete backtest over specified date range.
         Returns comprehensive results and performance metrics.
+        
+        Args:
+            start_date: Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+            end_date: End date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+            interval: Data interval (1s, 1m, 5m, etc.)
+            replay_speed: Speed multiplier for replay
         """
         try:
             self.replay_speed = replay_speed
             self.start_time = time.time()
             
-            logger.info(f"Starting backtest: {start_date} to {end_date} at {replay_speed}x speed")
+            logger.info(f"Starting backtest: {start_date} to {end_date} ({interval}) at {replay_speed}x speed")
             
-            # Load historical data
+            # Load historical data with interval
             tick_data = self.data_loader.load_binance_depth_data(
-                self.symbol, start_date, end_date
+                self.symbol, start_date, end_date, interval
             )
             
             # Convert to sorted list for counting and processing

@@ -12,7 +12,11 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from decimal import Decimal
 import threading
-from loguru import logger
+try:
+    from loguru import logger
+except ModuleNotFoundError:  # Fallback if loguru unavailable
+    import logging
+    logger = logging.getLogger(__name__)
 
 
 @dataclass

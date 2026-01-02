@@ -64,6 +64,8 @@ class PerformanceMetrics:
     total_fees: float
     fee_rate: float
     total_volume: float  # Total traded volume in USDT
+    taker_fees_paid: float
+    maker_rebates_received: float
     
     # Time-based Metrics
     start_time: float
@@ -105,6 +107,8 @@ class BacktestMetrics:
         self.avg_entry_price = 0.0
         self.realized_pnl = 0.0
         self.total_fees = 0.0
+        self.total_fees_paid = 0.0
+        self.total_fee_rebates = 0.0
         
         # Trade tracking
         self.trades: List[Dict] = []  # Completed round-trip trades
@@ -204,7 +208,11 @@ class BacktestMetrics:
             self.current_position += position_change
             self.current_cash += cash_change
             self.avg_entry_price = new_avg_price
-            self.total_fees += fill_event.fee
+            if fill_event.fee >= 0:
+                self.total_fees_paid += fill_event.fee
+            else:
+                self.total_fee_rebates += -fill_event.fee
+            self.total_fees = self.total_fees_paid - self.total_fee_rebates
             
             # Record execution metrics
             self.fill_latencies.append(fill_event.latency_ms)
@@ -345,9 +353,10 @@ class BacktestMetrics:
             
             # Gross P&L = sum of all trade P&Ls + unrealized P&L from open position
             gross_pnl = trade_pnls_sum + unrealized_pnl
-            
-            # Net P&L = gross P&L minus all fees
-            net_pnl = gross_pnl - self.total_fees
+
+            net_fees = self.total_fees_paid - self.total_fee_rebates
+            self.total_fees = net_fees
+            net_pnl = gross_pnl - net_fees
             total_pnl = net_pnl  # Net P&L is the final P&L
             
             # For dashboard compatibility, also update realized_pnl to match trade sum
@@ -473,7 +482,7 @@ class BacktestMetrics:
             
             # Volume and fee metrics
             total_volume = sum(fill.fill_quantity * fill.fill_price for fill in self.fill_events)
-            fee_rate = self.total_fees / max(total_volume, 1)
+            fee_rate = net_fees / max(total_volume, 1)
             
             # Calculate total return percentage
             total_return_pct = (total_pnl / self.initial_capital) * 100 if self.initial_capital > 0 else 0.0
@@ -515,9 +524,11 @@ class BacktestMetrics:
                 adverse_selection_rate=adverse_selection_rate,
                 
                 avg_fill_latency_ms=avg_fill_latency,
-                total_fees=self.total_fees,
+                total_fees=net_fees,
                 fee_rate=fee_rate,
                 total_volume=total_volume,
+                taker_fees_paid=self.total_fees_paid,
+                maker_rebates_received=self.total_fee_rebates,
                 
                 start_time=start_time,
                 end_time=end_time,
@@ -538,15 +549,42 @@ class BacktestMetrics:
             logger.error(f"Error calculating performance metrics: {e}")
             # Return default metrics on error
             return PerformanceMetrics(
-                total_pnl=0, realized_pnl=0, unrealized_pnl=0, gross_pnl=0, net_pnl=0,
+                total_pnl=0,
+                realized_pnl=0,
+                unrealized_pnl=0,
+                gross_pnl=0,
+                net_pnl=0,
                 total_return_pct=0.0,
-                sharpe_ratio=0, sortino_ratio=0, calmar_ratio=0, max_drawdown=0,
-                max_drawdown_duration=0, volatility=0, total_trades=0, winning_trades=0,
-                losing_trades=0, win_rate=0, avg_win=0, avg_loss=0, avg_trade_pnl=0, profit_factor=0,
-                fill_rate=0, quote_hit_rate=0, avg_spread_captured=0, inventory_turnover=0,
-                adverse_selection_rate=0, avg_fill_latency_ms=0, total_fees=0, fee_rate=0, total_volume=0,
-                start_time=current_time, end_time=current_time, duration_hours=0,
-                pnl_history=[], timestamps=[]
+                sharpe_ratio=0,
+                sortino_ratio=0,
+                calmar_ratio=0,
+                max_drawdown=0,
+                max_drawdown_duration=0,
+                volatility=0,
+                total_trades=0,
+                winning_trades=0,
+                losing_trades=0,
+                win_rate=0,
+                avg_win=0,
+                avg_loss=0,
+                avg_trade_pnl=0,
+                profit_factor=0,
+                fill_rate=0,
+                quote_hit_rate=0,
+                avg_spread_captured=0,
+                inventory_turnover=0,
+                adverse_selection_rate=0,
+                avg_fill_latency_ms=0,
+                total_fees=0,
+                fee_rate=0,
+                total_volume=0,
+                taker_fees_paid=0,
+                maker_rebates_received=0,
+                start_time=current_time,
+                end_time=current_time,
+                duration_hours=0,
+                pnl_history=[],
+                timestamps=[]
             )
     
     def get_pnl_series(self) -> List[Tuple[float, float]]:
@@ -893,6 +931,8 @@ class BacktestMetrics:
         self.avg_entry_price = 0.0
         self.realized_pnl = 0.0
         self.total_fees = 0.0
+        self.total_fees_paid = 0.0
+        self.total_fee_rebates = 0.0
         self.quote_updates = 0
         self.quote_hits = 0
         

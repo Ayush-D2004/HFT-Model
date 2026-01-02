@@ -31,7 +31,7 @@ from .fill_simulator_fifo import FIFOFillSimulator, FillEvent, TradeEvent, LOBSn
 from .metrics import BacktestMetrics, PerformanceMetrics
 from src.strategy import (
     AvellanedaStoikovPricer, QuoteManager, RiskManager, RiskLimits,
-    QuoteParameters, Order, OrderSide
+    QuoteParameters, Order, OrderSide, DynamicSpreadCalculator, FeeConfig
 )
 from src.data_ingestion import OrderBook
 from src.utils.config import config
@@ -39,16 +39,17 @@ from src.utils.config import config
 
 @dataclass
 class BacktestConfig:
-    """Backtesting configuration"""
+    """Backtesting configuration with fee-aware dynamic spread"""
     # Time period
     start_date: str
     end_date: str
     symbol: str = "BTCUSDT"
+    interval: str = "1s"  # DEFAULT: 1-second data for HFT (changed from 1m)
     
     # Strategy parameters - OPTIMIZED FOR HFT MARKET MAKING
     gamma: float = 0.015  # Risk aversion - typical HFT range 0.01-0.02
     time_horizon: float = 10.0  # Time horizon in seconds - HFT uses 5-15s
-    min_spread: float = 0.0035  # Minimum spread 0.35% (35 bps) - INCREASED to beat fees + adverse selection
+    min_spread: float = 0.0035  # DEPRECATED: Use dynamic spread instead (kept for backward compatibility)
     tick_size: float = 0.01
     lot_size: float = 0.001
     
@@ -57,10 +58,21 @@ class BacktestConfig:
     max_daily_loss: float = 1000.0  
     max_drawdown: float = 0.30  # 30% - realistic for market making
     
-    # Fill simulation - BINANCE ACTUAL FEES
+    # Fee-aware spread calculation (NEW)
+    use_dynamic_spread: bool = True  # Enable fee-aware dynamic spread
     maker_fee: float = 0.0002  # 0.02% - Binance maker fee (limit orders)
     taker_fee: float = 0.0005  # 0.05% - Binance taker fee (market orders)
-    # Note: base_fill_probability removed - now using realistic distance-based curve for 70-85% fill rate
+    safety_margin: float = 0.0003  # 0.03% - Safety buffer for adverse selection
+    post_only: bool = True  # Maker-only mode (reject taker fills)
+    
+    # Dynamic spread parameters (NEW)
+    vol_alpha: float = 0.2  # EWMA alpha for volatility (5-period equivalent)
+    imbalance_alpha: float = 0.4  # EWMA alpha for order book imbalance (2.5-period)
+    vol_multiplier: float = 2.0  # Spread widening factor for volatility
+    imbalance_multiplier: float = 0.5  # Spread widening factor for imbalance
+    inventory_multiplier: float = 0.001  # Spread skew factor for inventory
+    
+    # Fill simulation
     latency_mean_ms: float = 50.0
     
     # Execution
@@ -93,6 +105,26 @@ class StrategyBacktester:
         self.config = config
         self.fill_simulator = fill_simulator
         self.metrics = metrics
+        
+        # Initialize fee-aware dynamic spread calculator (NEW)
+        if config.use_dynamic_spread:
+            fee_config = FeeConfig(
+                maker_fee=config.maker_fee,
+                taker_fee=config.taker_fee,
+                safety_margin=config.safety_margin
+            )
+            self.spread_calculator = DynamicSpreadCalculator(
+                fee_config=fee_config,
+                vol_alpha=config.vol_alpha,
+                imbalance_alpha=config.imbalance_alpha,
+                vol_multiplier=config.vol_multiplier,
+                imbalance_multiplier=config.imbalance_multiplier,
+                inventory_multiplier=config.inventory_multiplier
+            )
+            logger.info(f"Dynamic spread calculator initialized with breakeven={self.spread_calculator.breakeven_spread:.4f} ({self.spread_calculator.breakeven_spread*10000:.1f} bps)")
+        else:
+            self.spread_calculator = None
+            logger.info(f"Using static min_spread={config.min_spread:.4f}")
         
         # Initialize strategy components
         self.pricer = AvellanedaStoikovPricer(
@@ -128,6 +160,7 @@ class StrategyBacktester:
         self.active_quote_id = None  # Current active quote ID
         
         logger.info(f"StrategyBacktester initialized for {config.symbol}")
+
     
     def _order_callback(self, order_data) -> Dict[str, Any]:
         """Handle order placement/cancellation from quote manager"""
@@ -191,7 +224,8 @@ class StrategyBacktester:
                 fill_event.order_id,
                 fill_event.fill_price,
                 fill_event.fill_quantity,
-                fill_event.timestamp
+                fill_event.timestamp,
+                fee=fill_event.fee
             )
             
             # Update metrics
@@ -327,13 +361,48 @@ class StrategyBacktester:
         )
     
     def _update_quotes(self, timestamp: float) -> None:
-        """Update market quotes"""
+        """Update market quotes with dynamic spread calculation"""
         try:
-            # 🚀 PROFESSIONAL HFT: Use config min_spread (now 8 bps for competitiveness)
+            # Calculate spread dynamically if enabled
+            if self.config.use_dynamic_spread and self.spread_calculator is not None:
+                # Update spread calculator with current market state
+                self.spread_calculator.update_volatility(self.current_price)
+                
+                # Get order book depth for imbalance calculation
+                # Note: In real implementation, get from order_book snapshot
+                # For now, use placeholder values (will be updated with real LOB data)
+                bid_depth = 10.0  # Placeholder
+                ask_depth = 10.0  # Placeholder
+                self.spread_calculator.update_imbalance(bid_depth, ask_depth)
+                
+                # Compute dynamic spread
+                spread_state = self.spread_calculator.compute_spread(
+                    inventory=self.risk_manager.current_position,
+                    max_position=self.config.max_position
+                )
+                
+                # Use dynamic half-spread as min_spread
+                dynamic_min_spread = spread_state.half_spread * 2  # Convert half-spread to full spread
+                
+                # Log dynamic spread periodically
+                if self.quote_sequence % 500 == 0:
+                    logger.info(f"🎯 Dynamic Spread: breakeven={spread_state.breakeven_spread:.4f}, "
+                              f"dynamic={spread_state.dynamic_spread:.4f}, "
+                              f"half={spread_state.half_spread:.4f}, "
+                              f"vol={spread_state.volatility:.6f}, "
+                              f"imb={spread_state.imbalance:.3f}")
+                
+                # Use dynamic spread
+                min_spread_to_use = max(dynamic_min_spread, self.config.min_spread)  # Floor at config min
+            else:
+                # Use static min_spread from config (backward compatibility)
+                min_spread_to_use = self.config.min_spread
+            
+            # Create quote parameters with dynamic or static spread
             quote_params = QuoteParameters(
                 gamma=self.config.gamma,
                 T=self.config.time_horizon,
-                min_spread=self.config.min_spread  # Use config value (8 bps)
+                min_spread=min_spread_to_use
             )
             
             # Update quotes via quote manager
@@ -350,6 +419,7 @@ class StrategyBacktester:
                 if self.quote_sequence % 500 == 0:
                     logger.info(f"📊 Quote #{self.quote_sequence}: Bid={self.quote_manager.current_bid_order.price:.2f}, "
                               f"Ask={self.quote_manager.current_ask_order.price:.2f}, "
+                              f"Spread={min_spread_to_use:.4f} ({min_spread_to_use*10000:.1f} bps), "
                               f"Position={self.risk_manager.current_position:.4f}")
             else:
                 # Reduced logging frequency for failures
@@ -440,7 +510,8 @@ class BacktestEngine:
             print("Processing REAL historical data from Binance...")
             replay_results = replay_engine.run_backtest(
                 start_date=config.start_date,
-                end_date=config.end_date
+                end_date=config.end_date,
+                interval=config.interval
             )
             
             if not replay_results.get('success', False):
@@ -454,6 +525,7 @@ class BacktestEngine:
                         losing_trades=0, win_rate=0, avg_win=0, avg_loss=0, profit_factor=0,
                         fill_rate=0, quote_hit_rate=0, avg_spread_captured=0, inventory_turnover=0,
                         adverse_selection_rate=0, avg_fill_latency_ms=0, total_fees=0, fee_rate=0,
+                        taker_fees_paid=0, maker_rebates_received=0,
                         start_time=time.time(), end_time=time.time(), duration_hours=0
                     ),
                     success=False,
@@ -560,6 +632,8 @@ class BacktestEngine:
                 total_fees=performance.total_fees,
                 fee_rate=performance.fee_rate,
                 total_volume=performance.total_volume,
+                taker_fees_paid=performance.taker_fees_paid,
+                maker_rebates_received=performance.maker_rebates_received,
                 start_time=performance.start_time,
                 end_time=performance.end_time,
                 duration_hours=performance.duration_hours,
@@ -610,6 +684,7 @@ class BacktestEngine:
                     losing_trades=0, win_rate=0, avg_win=0, avg_loss=0, profit_factor=0,
                     fill_rate=0, quote_hit_rate=0, avg_spread_captured=0, inventory_turnover=0,
                     adverse_selection_rate=0, avg_fill_latency_ms=0, total_fees=0, fee_rate=0,
+                    taker_fees_paid=0, maker_rebates_received=0,
                     start_time=time.time(), end_time=time.time(), duration_hours=0
                 ),
                 success=False,

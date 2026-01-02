@@ -134,7 +134,9 @@ class FIFOFillSimulator:
             'quotes_submitted': 0,  # Track quote pairs submitted
             'quotes_filled': 0,  # Track quote pairs that got at least one fill
             'total_fill_volume': 0.0,
-            'total_fees_paid': 0.0,
+            'net_fees_paid': 0.0,
+            'taker_fees_paid': 0.0,
+            'maker_rebates_received': 0.0,
             'avg_fill_latency_ms': 0.0,
             'fill_rate': 0.0,  # Will be: quotes_filled / quotes_submitted
             'maker_fills': 0,
@@ -572,7 +574,7 @@ class FIFOFillSimulator:
                     timestamp: float, is_maker: bool):
         """Record fill and update metrics"""
         fee_rate = self.maker_fee if is_maker else self.taker_fee
-        fee = fill_qty * fill_price * abs(fee_rate)
+        fee = fill_qty * fill_price * fee_rate
         
         # Convert back to OrderSide enum
         side = OrderSide.BID if order.side == "BUY" else OrderSide.ASK
@@ -600,11 +602,15 @@ class FIFOFillSimulator:
         # Update statistics
         self.stats['orders_filled'] += 1
         self.stats['total_fill_volume'] += fill_qty
-        self.stats['total_fees_paid'] += fee
+        self.stats['net_fees_paid'] += fee
         if is_maker:
             self.stats['maker_fills'] += 1
+            if fee < 0:
+                self.stats['maker_rebates_received'] += -fee
         else:
             self.stats['taker_fills'] += 1
+            if fee > 0:
+                self.stats['taker_fees_paid'] += fee
         
         # Update fill rate: percentage of quotes that get filled
         # Fill rate = (unique quote pairs that got filled) / (total quote pairs submitted)
@@ -639,15 +645,40 @@ class FIFOFillSimulator:
         
         # Only count each quote ID once
         if quote_id is not None and quote_id not in self.filled_quote_ids:
-            self.stats['quotes_filled'] += 1
             self.filled_quote_ids.add(quote_id)
+            
+            # ✅ CRITICAL FIX: Ensure quotes_filled never exceeds quotes_submitted
+            # This prevents counting bugs where fills from old/stale quotes inflate the counter
+            if self.stats['quotes_filled'] < self.stats['quotes_submitted']:
+                self.stats['quotes_filled'] += 1
+            else:
+                logger.warning(f"⚠️ Quote fill counter already at max ({self.stats['quotes_submitted']}). "
+                             f"Ignoring fill for quote_id={quote_id} (possible stale order or delayed fill)")
     
     def add_fill_callback(self, callback: Callable[[FillEvent], None]) -> None:
         """Add callback for fill notifications"""
         self.fill_callbacks.append(callback)
 
     def get_statistics(self) -> Dict:
-        """Get fill simulator statistics"""
+        """Get fill simulator statistics with validation"""
+        # ✅ Validate and correct statistics before returning
+        quotes_submitted = self.stats['quotes_submitted']
+        quotes_filled = self.stats['quotes_filled']
+        orders_filled = self.stats['orders_filled']
+        
+        # CRITICAL VALIDATION: quotes_filled must be <= quotes_submitted
+        if quotes_filled > quotes_submitted:
+            logger.error(f"🐛 BUG DETECTED: quotes_filled ({quotes_filled}) > quotes_submitted ({quotes_submitted})! "
+                        f"Capping quotes_filled to quotes_submitted.")
+            self.stats['quotes_filled'] = quotes_submitted
+            quotes_filled = quotes_submitted
+        
+        # LOGICAL VALIDATION: orders_filled should be >= quotes_filled
+        # (because each filled quote has at least 1 order fill, possibly 2)
+        if orders_filled < quotes_filled:
+            logger.warning(f"⚠️ Inconsistency: orders_filled ({orders_filled}) < quotes_filled ({quotes_filled}). "
+                          f"This suggests a counting error in fill tracking.")
+        
         return {
             **self.stats,
             'pending_orders': sum(1 for o in self.active_orders.values() 
@@ -682,7 +713,9 @@ class FIFOFillSimulator:
             'quotes_submitted': 0,
             'quotes_filled': 0,
             'total_fill_volume': 0.0,
-            'total_fees_paid': 0.0,
+            'net_fees_paid': 0.0,
+            'taker_fees_paid': 0.0,
+            'maker_rebates_received': 0.0,
             'avg_fill_latency_ms': 0.0,
             'fill_rate': 0.0,
             'maker_fills': 0,

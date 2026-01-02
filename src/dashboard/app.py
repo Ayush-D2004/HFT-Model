@@ -102,8 +102,90 @@ def create_backtesting_section():
     
     with col4:
         st.markdown("**Time Scope**")
-        start_date = st.date_input("Start Date", datetime.now() - timedelta(days=4))
-        end_date = st.date_input("End Date", datetime.now())
+        # Data interval selector
+        interval = st.selectbox(
+            "Data Interval",
+            options=["1m", "1s"],
+            format_func=lambda x: {"1m": "1 minute", "1s": "1 second"}[x],
+            index=0,
+            key="bt_interval",
+            help="1m = 1-minute candles (standard). 1s = 1-second candles (high-frequency, use short time windows!)"
+        )
+        
+        # Show different UI based on interval
+        if interval == "1s":
+            
+            # Use session state to allow reset button to work
+            if 'reset_time_1s' not in st.session_state:
+                st.session_state.reset_time_1s = 0
+            
+            # Default to last 10 minutes from NOW (in UTC)
+            from datetime import timezone
+            default_end = datetime.now(timezone.utc)
+            default_start = default_end - timedelta(minutes=10)
+            
+            start_datetime = st.text_input(
+                "Start Time (UTC)",
+                value=default_start.strftime("%Y-%m-%d %H:%M:%S"),
+                key=f"bt_start_1s_{st.session_state.reset_time_1s}",
+                help="Recent time only! Use current time for best results."
+            )
+            end_datetime = st.text_input(
+                "End Time (UTC)",
+                value=default_end.strftime("%Y-%m-%d %H:%M:%S"),
+                key=f"bt_end_1s_{st.session_state.reset_time_1s}",
+                help="Recent time only! Use current time for best results."
+            )
+            
+            # Quick action button to reset to current time
+            if st.button("🔄 Reset to Current Time (Last 10 min)", key="reset_time_1s_btn"):
+                st.session_state.reset_time_1s += 1
+                st.rerun()
+            
+            # Parse for validation
+            try:
+                from datetime import timezone as tz
+                start_dt = datetime.strptime(start_datetime, "%Y-%m-%d %H:%M:%S")
+                end_dt = datetime.strptime(end_datetime, "%Y-%m-%d %H:%M:%S")
+                
+                # Check if dates are recent enough for 1s data
+                now_utc = datetime.now(tz.utc).replace(tzinfo=None)
+                days_ago = (now_utc - end_dt).total_seconds() / 86400
+                
+                if days_ago > 7:
+                    st.error(f"❌ End time is {days_ago:.1f} days old. Binance 1s data only available for last 7 days!")
+                    st.info("💡 Use current time: Click 'Use Now' or adjust dates to recent times")
+                elif days_ago < -0.1:  # Future date
+                    st.error(f"❌ End time is in the future! Use current time or recent past.")
+                
+                duration = (end_dt - start_dt).total_seconds() / 60
+                st.info(f"📊 Duration: {duration:.1f} minutes (~{int(duration * 60):,} data points)")
+                if duration > 30:
+                    st.error("⚠️ Duration > 30 min may cause slow processing. Recommended: 5-15 minutes.")
+                elif duration <= 0:
+                    st.error("❌ Start time must be before end time!")
+            except ValueError:
+                st.error("Invalid datetime format. Use: YYYY-MM-DD HH:MM:SS")
+        else:
+            # For 1-minute data, use standard date input
+            # Allow data up to today (Binance has data up to a few minutes ago)
+            default_end = datetime.now()  # Today
+            default_start = default_end - timedelta(days=4)  # 4 days ago
+            
+            start_date = st.date_input(
+                "Start Date", 
+                default_start.date(),
+                help="Binance has historical data going back months/years."
+            )
+            end_date = st.date_input(
+                "End Date", 
+                default_end.date(),
+                help="Can use today! Binance has data up to a few minutes ago."
+            )
+            
+            # Only validate that start is before end (no future check needed - today is OK!)
+            if start_date >= end_date:
+                st.error("❌ Start date must be BEFORE end date!")
     
     # Advanced parameters in expander (full width)
     with st.expander("Advanced Parameters"):
@@ -116,25 +198,55 @@ def create_backtesting_section():
                                       help="Minimum order size. Use 0.001 for BTC (realistic HFT size)", key="bt_lot_size", format="%.4f")
 
     # Error checking
-    if start_date >= end_date:
-        st.error("Start date must be before end date")
-        return
+    if interval == "1s":
+        # Validate datetime strings
+        try:
+            start_dt = datetime.strptime(start_datetime, "%Y-%m-%d %H:%M:%S")
+            end_dt = datetime.strptime(end_datetime, "%Y-%m-%d %H:%M:%S")
+            if start_dt >= end_dt:
+                st.error("Start time must be before end time")
+                return
+        except ValueError:
+            st.error("Invalid datetime format. Use: YYYY-MM-DD HH:MM:SS")
+            return
+    else:
+        if start_date >= end_date:
+            st.error("Start date must be before end date")
+            return
     
     # Run backtest button - centered and full width
     st.markdown("---")
     if st.button("🚀 Run Backtest", type="primary", width="stretch"):
-        run_backtest({
-            'symbol': symbol,
-            'gamma': gamma,
-            'time_horizon': time_horizon,
-            'min_spread': min_spread,
-            'max_drawdown_pct': max_drawdown_pct,
-            'initial_balance': initial_balance,
-            'tick_size': tick_size,
-            'lot_size': lot_size,
-            'start_date': start_date,
-            'end_date': end_date
-        })
+        # Prepare parameters based on interval type
+        if interval == "1s":
+            params = {
+                'symbol': symbol,
+                'gamma': gamma,
+                'time_horizon': time_horizon,
+                'min_spread': min_spread,
+                'max_drawdown_pct': max_drawdown_pct,
+                'initial_balance': initial_balance,
+                'tick_size': tick_size,
+                'lot_size': lot_size,
+                'interval': interval,
+                'start_datetime': start_datetime,
+                'end_datetime': end_datetime
+            }
+        else:
+            params = {
+                'symbol': symbol,
+                'gamma': gamma,
+                'time_horizon': time_horizon,
+                'min_spread': min_spread,
+                'max_drawdown_pct': max_drawdown_pct,
+                'initial_balance': initial_balance,
+                'tick_size': tick_size,
+                'lot_size': lot_size,
+                'interval': interval,
+                'start_date': start_date,
+                'end_date': end_date
+            }
+        run_backtest(params)
     
     # Results section - Full width below configuration
     st.markdown("---")
@@ -152,18 +264,50 @@ def run_backtest(params: Dict):
         with st.spinner("Running backtest..."):
             logger.info(f"Starting backtest with params: {params}")
             
-            # Create backtest configuration
-            config = BacktestConfig(
-                symbol=params['symbol'],
-                start_date=params['start_date'].strftime('%Y-%m-%d'),
-                end_date=params['end_date'].strftime('%Y-%m-%d'),
-                initial_capital=params['initial_balance'],
-                gamma=params['gamma'],
-                time_horizon=params['time_horizon'],
-                min_spread=params['min_spread'],
-                max_drawdown=params['max_drawdown_pct'] / 100.0,
-                tick_size=params['tick_size']
-            )
+            # Handle different interval types
+            interval = params.get('interval', '1m')
+            
+            if interval == "1s":
+                # For 1-second data, use datetime strings
+                config = BacktestConfig(
+                    symbol=params['symbol'],
+                    start_date=params['start_datetime'],  # Pass as string
+                    end_date=params['end_datetime'],      # Pass as string
+                    initial_capital=params['initial_balance'],
+                    gamma=params['gamma'],
+                    time_horizon=params['time_horizon'],
+                    min_spread=params['min_spread'],
+                    max_drawdown=params['max_drawdown_pct'] / 100.0,
+                    tick_size=params['tick_size'],
+                    interval=interval
+                )
+                
+                # Show warning about processing time
+                start_dt = datetime.strptime(params['start_datetime'], "%Y-%m-%d %H:%M:%S")
+                end_dt = datetime.strptime(params['end_datetime'], "%Y-%m-%d %H:%M:%S")
+                duration_min = (end_dt - start_dt).total_seconds() / 60
+                estimated_rows = int(duration_min * 60)
+                
+                st.info(f"""
+                ⚡ **High-Frequency Mode (1-second data)**
+                - Duration: {duration_min:.1f} minutes
+                - Estimated data points: ~{estimated_rows:,}
+                - This may take 30-60 seconds to process...
+                """)
+            else:
+                # For 1-minute data, use date objects
+                config = BacktestConfig(
+                    symbol=params['symbol'],
+                    start_date=params['start_date'].strftime('%Y-%m-%d'),
+                    end_date=params['end_date'].strftime('%Y-%m-%d'),
+                    initial_capital=params['initial_balance'],
+                    gamma=params['gamma'],
+                    time_horizon=params['time_horizon'],
+                    min_spread=params['min_spread'],
+                    max_drawdown=params['max_drawdown_pct'] / 100.0,
+                    tick_size=params['tick_size'],
+                    interval=interval
+                )
             
             # Run backtest
             engine = BacktestEngine()
@@ -269,11 +413,6 @@ def display_backtest_results(results):
                     <li><b>Total Volume:</b> ${perf.total_volume:,.0f}</li>
                 </ul>
                 <p style="margin: 10px 0 0 0; padding: 10px; background-color: rgba(255,255,255,0.7); border-radius: 5px;">
-                <b>🎯 Bottom Line:</b> This is a <b>professional-grade HFT market making strategy</b>. 
-                The results show realistic profitability with controlled risk. Your {perf.win_rate:.0%} win rate 
-                and ${perf.avg_trade_pnl:.2f} avg trade are typical for institutional market makers. 
-                {f"Negative Sharpe ratio ({perf.sharpe_ratio:.2f}) indicates drawdown volatility during the test period - this is normal for market making strategies during trending markets." if perf.sharpe_ratio < 0 else f"Sharpe ratio of {perf.sharpe_ratio:.2f} shows good risk-adjusted returns."}
-                </p>
                 </div>
                 """, unsafe_allow_html=True)
         
@@ -324,7 +463,99 @@ def display_backtest_results(results):
             
             elif perf.total_pnl < 0:
                 st.error(f"⚠️ **Negative P&L: ${perf.total_pnl:.2f}**")
-                st.markdown("Consider adjusting strategy parameters or risk limits")
+                
+                # Add fee analysis
+                if hasattr(results, 'metrics') and hasattr(results.metrics, 'trades'):
+                    trades = results.metrics.trades
+                    gross_pnl = sum(t['pnl'] for t in trades)
+                    total_fees = perf.total_fees if hasattr(perf, 'total_fees') else 0
+                    
+                    st.warning(f"""
+                    **💡 Fee Analysis:**
+                    - Gross P&L (before fees): **${gross_pnl:.2f}**
+                    - Total Fees Paid: **${total_fees:.2f}**
+                    - Net P&L (after fees): **${perf.total_pnl:.2f}**
+                    
+                    **Issue:** Fees are eating all your profits! Your spreads are too narrow.
+                    
+                    **Solutions:**
+                    1. **Increase min_spread** to 0.003-0.005 (0.3%-0.5%)
+                    2. **Reduce trade frequency** by increasing time_horizon
+                    3. **Current spread** may not beat 0.02% maker + 0.05% taker fees
+                    """)
+                else:
+                    st.markdown("Consider adjusting strategy parameters or risk limits")
+            
+            # ============================================
+            # FEE IMPACT WARNING - Check even for positive P&L
+            # ============================================
+            if hasattr(results, 'metrics') and hasattr(results.metrics, 'trades') and perf.total_trades > 0:
+                trades = results.metrics.trades
+                gross_pnl = sum(t['pnl'] for t in trades)
+                total_fees = perf.total_fees if hasattr(perf, 'total_fees') else 0
+                
+                # Calculate fee impact
+                if gross_pnl > 0:
+                    fee_impact_pct = (total_fees / gross_pnl) * 100
+                    
+                    # Show warning if fee impact is too high (even for profitable strategies)
+                    if fee_impact_pct > 50:
+                        if perf.total_pnl > 0:
+                            st.warning(f"""
+                            ### ⚠️ HIGH FEE IMPACT: {fee_impact_pct:.1f}% (Target: <30%)
+                            
+                            **Current Performance:**
+                            - Gross P&L: **${gross_pnl:.2f}**
+                            - Total Fees: **${total_fees:.2f}**
+                            - Net P&L: **${perf.total_pnl:.2f}** ✅
+                            - Fee Impact: **{fee_impact_pct:.1f}%** ⚠️
+                            - Avg P&L/Trade: **${perf.avg_trade_pnl:.4f}**
+                            
+                            **Analysis:**
+                            You're profitable, but **{fee_impact_pct:.1f}% of your gross profit** goes to fees!
+                            This is inefficient. Professional HFT targets **<30% fee impact**.
+                            
+                            **Why This Matters:**
+                            - Breakeven spread (13 bps) only covers fees with thin margin
+                            - Dynamic spread is working but needs MORE buffer above breakeven
+                            - Small adverse selection wipes out profit
+                            
+                            **Solutions to Improve Fee Efficiency:**
+                            
+                            1. **Increase `safety_margin`** from 0.03% to 0.05-0.10%
+                               - This widens breakeven spread to 15-20 bps
+                               - More cushion above fees = better profit per trade
+                            
+                            2. **Increase `vol_multiplier`** from 2.0 to 3.0-4.0
+                               - Wider spreads during volatility = less adverse selection
+                               - Reduces fee impact by capturing more per trade
+                            
+                            3. **Increase `min_spread` floor** from current to 0.003-0.005
+                               - Ensures minimum profit margin per trade
+                               - Prevents razor-thin spreads
+                            
+                            4. **Reduce trade frequency** by increasing `time_horizon` to 20-30s
+                               - Fewer trades = fewer fees
+                               - Let profitable positions run longer
+                            
+                            **Target Metrics:**
+                            - Fee Impact: <30% of gross P&L ✅
+                            - Avg P&L/Trade: >$0.10 (currently ${perf.avg_trade_pnl:.4f})
+                            - Trades: 200-400 (fewer, higher quality)
+                            """)
+                    elif fee_impact_pct > 30:
+                        st.info(f"""
+                        ### 💡 Fee Impact: {fee_impact_pct:.1f}% (Acceptable, but can improve)
+                        
+                        Your fee impact is acceptable but **can be optimized to <30%**.
+                        Consider slightly increasing `safety_margin` or `vol_multiplier` for better efficiency.
+                        """)
+                    else:
+                        st.success(f"""
+                        ### ✅ Fee Impact: {fee_impact_pct:.1f}% (Excellent!)
+                        
+                        Your fee efficiency is excellent! Fee impact is well below 30% target.
+                        """)
         
         # Performance metrics
         col1, col2, col3, col4 = st.columns(4)
@@ -495,12 +726,99 @@ def display_backtest_results(results):
                 order_fill_rate = (total_fills / max(total_orders_submitted, 1)) * 100
                 quotes_per_candle = quotes_submitted / max(data_points, 1)
                 
-                st.write(f"**Market Data Points:** {data_points:,} 1-minute candles received from Binance")
+                # ✅ VALIDATION: Check for counting bugs
+                if quotes_filled > quotes_submitted:
+                    st.error(f"🐛 **DATA BUG DETECTED:** Quotes with fills ({quotes_filled:,}) > Quotes submitted ({quotes_submitted:,})!")
+                    st.warning("This is impossible and indicates a counting error. The fill simulator has been fixed to prevent this.")
+                
+                st.write(f"**Market Data Points:** {data_points:,} candles received from Binance")
                 st.write(f"**Quotes Submitted:** {quotes_submitted:,} quote pairs sent to market ({quotes_per_candle:.2f} quotes/candle)")
                 st.write(f"**Quotes with Fills:** {quotes_filled:,} quote pairs that got at least one side filled")
+                st.caption(f"   ℹ️ *Quote fill rate: {(quotes_filled/max(quotes_submitted,1)*100):.1f}% of quote pairs got at least one fill*")
                 st.write(f"**Total Fill Events:** {total_fills:,} individual order fills (bid + ask sides)")
+                st.caption(f"   ℹ️ *Avg fills per filled quote: {(total_fills/max(quotes_filled,1)):.2f} (1.0 = one side only, 2.0 = both sides)*")
+                st.write(f"**Order Fill Rate:** {order_fill_rate:.2f}% (industry standard metric)")
+                st.caption(f"   ℹ️ *This is {total_fills:,} filled orders ÷ {total_orders_submitted:,} total orders (quotes × 2)*")
                 
-                st.success(f"✅ **Order Fill Rate: {order_fill_rate:.1f}%** = {total_fills:,} filled orders / {total_orders_submitted:,} total orders")
+                # Add detailed explanation box
+                with st.expander("📖 **Understanding Fill Metrics** - Click to expand"):
+                    st.markdown("""
+                    ### 🎯 Key Concepts:
+                    
+                    **1. Quote Pair (Bid + Ask)**
+                    - Every time the strategy updates quotes, it submits **ONE quote pair**
+                    - Each quote pair contains: **1 bid order** + **1 ask order** = **2 individual orders**
+                    - Example: Quote #1 = Bid at $95,000 + Ask at $95,100
+                    
+                    **2. Quotes with Fills (Quote-Level Metric)**
+                    - Counts **unique quote pairs** where at least **ONE side** got filled
+                    - If bid fills → count = 1
+                    - If ask fills → count = 1  
+                    - If **BOTH** bid AND ask fill → still count = **1** (same quote pair)
+                    - This measures: "What percentage of my quotes were competitive enough to get filled?"
+                    
+                    **3. Total Fill Events (Order-Level Metric)**
+                    - Counts **every individual order fill** separately
+                    - Each quote pair can produce 0, 1, or 2 fill events
+                    - If only bid fills → 1 fill event
+                    - If only ask fills → 1 fill event
+                    - If both fill → 2 fill events
+                    - This measures: "How many actual trades happened?"
+                    
+                    ---
+                    
+                    ### 📊 Example Scenario:
+                    
+                    ```
+                    Quote #1: Bid $95,000 + Ask $95,100
+                    → Bid fills ✅, Ask doesn't ❌
+                    → Quotes with Fills: +1
+                    → Total Fill Events: +1
+                    
+                    Quote #2: Bid $95,010 + Ask $95,110  
+                    → Both sides fill ✅✅
+                    → Quotes with Fills: +1
+                    → Total Fill Events: +2
+                    
+                    Quote #3: Bid $95,020 + Ask $95,120
+                    → Neither fills ❌❌
+                    → Quotes with Fills: +0
+                    → Total Fill Events: +0
+                    
+                    Results:
+                    - Quotes Submitted: 3
+                    - Quotes with Fills: 2 (66.7% quote fill rate)
+                    - Total Fill Events: 3 (1.5 fills per filled quote)
+                    ```
+                    
+                    ---
+                    
+                    ### 🔢 Mathematical Relationships:
+                    
+                    **Always True:**
+                    - `Quotes with Fills ≤ Quotes Submitted` (can't fill more quotes than you sent)
+                    - `Total Fill Events ≥ Quotes with Fills` (each filled quote has at least 1 order fill)
+                    - `Total Fill Events ≤ Quotes Submitted × 2` (max 2 orders per quote)
+                    
+                    **Ratio Interpretation:**
+                    - `Fills per Quote = Total Fill Events ÷ Quotes with Fills`
+                    - **1.0** = Only one side filling (typical for directional market)
+                    - **1.5** = Balanced mix of single and double fills
+                    - **2.0** = Both sides always filling (very rare, only in choppy/ranging market)
+                    
+                    ---
+                    
+                    ### 💡 What's Normal?
+                    
+                    **Quote Fill Rate:** 50-95%
+                    - High (>80%) = Quotes very competitive, close to market
+                    - Low (<50%) = Quotes too far from market, adjust gamma/spread
+                    
+                    **Fills per Quote:** 1.0-1.5
+                    - **~1.0-1.2** = Typical for HFT (one-sided fills)
+                    - **~1.5** = Good balance (some quotes fill both sides)
+                    - **>1.8** = Unusual (getting hit on both sides often - may indicate wide spreads or ranging market)
+                    """)
                 
                 st.markdown("---")
             
@@ -509,7 +827,19 @@ def display_backtest_results(results):
             
             if len(trades) > 0:
                 trade_pnls = [t['pnl'] for t in trades]
-                st.write(f"**Sum of Trade P&Ls:** ${sum(trade_pnls):.2f}")
+                gross_pnl = sum(trade_pnls)
+                st.write(f"**Sum of Trade P&Ls (Gross):** ${gross_pnl:.2f}")
+                
+                # Calculate fees impact
+                if hasattr(results, 'performance'):
+                    perf = results.performance
+                    total_fees = getattr(perf, 'total_fees', 0)
+                    net_pnl = getattr(perf, 'total_pnl', 0)
+                    fees_impact = gross_pnl - net_pnl
+                    
+                    st.write(f"**Total Fees Paid:** ${total_fees:.2f}")
+                    st.write(f"**Net P&L (After Fees):** ${net_pnl:.2f}")
+                    
                 
                 winning_trades_count = len([p for p in trade_pnls if p > 0])
                 losing_trades_count = len([p for p in trade_pnls if p < 0])

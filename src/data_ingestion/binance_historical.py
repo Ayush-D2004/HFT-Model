@@ -91,24 +91,73 @@ class BinanceHistoricalDataFetcher:
             symbol: Trading pair (e.g., 'BTCUSDT')
             start_time: Start datetime (UTC)
             end_time: End datetime (UTC) 
-            interval: Kline interval (1m, 5m, 15m, 1h, etc.)
+            interval: Kline interval (1s, 1m, 5m, 15m, 1h, etc.)
+                     Supported: 1s, 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
             
         Returns:
             DataFrame with OHLCV data
         """
-        # Check cache first
-        cache_key = f"{symbol}_{interval}_{start_time.strftime('%Y%m%d')}_{end_time.strftime('%Y%m%d')}"
+        # Check cache first - include time for 1s intervals
+        if interval == "1s":
+            # For 1-second data, include hour/minute in cache key to avoid conflicts
+            cache_key = f"{symbol}_{interval}_{start_time.strftime('%Y%m%d_%H%M')}_{end_time.strftime('%Y%m%d_%H%M')}"
+        else:
+            cache_key = f"{symbol}_{interval}_{start_time.strftime('%Y%m%d')}_{end_time.strftime('%Y%m%d')}"
+        
         cache_file = self.cache_dir / f"{cache_key}.csv"
         
         if cache_file.exists():
-            logger.info(f"Loading cached data for {symbol}")
+            logger.info(f"Loading cached data for {symbol} ({interval})")
             return pd.read_csv(cache_file, index_col=0, parse_dates=True)
         
-        logger.info(f"Fetching {symbol} kline data from {start_time} to {end_time}")
+        # Log with data size estimate
+        time_diff = end_time - start_time
+        if interval == "1s":
+            estimated_rows = int(time_diff.total_seconds())
+            
+            # Check if date is too old for 1s data
+            from datetime import timezone as tz
+            now_utc = datetime.now(tz.utc)
+            days_old = (now_utc - end_time).total_seconds() / 86400
+            
+            if days_old > 7:
+                logger.error(f"❌ Data too old for 1s interval!")
+                logger.error(f"   Requested: {end_time} (UTC)")
+                logger.error(f"   Age: {days_old:.1f} days old")
+                logger.error(f"   Binance 1s data only available for last ~7 days")
+                logger.error(f"   💡 Use current time or recent dates")
+            elif days_old < -0.1:
+                logger.error(f"❌ End time is in the FUTURE: {end_time}")
+                logger.error(f"   Current UTC time: {now_utc}")
+                logger.error(f"   💡 Use current time or recent past dates")
+            
+            logger.info(f"Fetching {symbol} 1-second data from {start_time} to {end_time}")
+            logger.info(f"⚠️  Estimated rows: {estimated_rows:,} (high-frequency data)")
+            logger.info(f"⚠️  Data age: {days_old:.1f} days (must be < 7 days for 1s interval)")
+        else:
+            logger.info(f"Fetching {symbol} {interval} data from {start_time} to {end_time}")
         
         # Convert to milliseconds
         start_ms = int(start_time.timestamp() * 1000)
         end_ms = int(end_time.timestamp() * 1000)
+        
+        # Validate timestamps - only check if significantly in future (>1 hour)
+        from datetime import timezone as tz
+        now_utc = datetime.now(tz.utc)
+        time_diff_hours = (end_time - now_utc).total_seconds() / 3600
+        
+        if time_diff_hours > 1:  # Only error if more than 1 hour in future
+            logger.error(f"❌ CRITICAL: End time is significantly in the FUTURE!")
+            logger.error(f"   Requested end: {end_time}")
+            logger.error(f"   Current time:  {now_utc}")
+            logger.error(f"   Difference: {time_diff_hours:.1f} hours in future")
+            logger.error(f"   💡 Check your system clock or use current/past dates")
+            return pd.DataFrame()
+        elif time_diff_hours > 0:
+            # Small future offset is OK (data might lag by a few minutes)
+            logger.info(f"ℹ️  End time is {time_diff_hours*60:.1f} minutes in future - OK (data may lag slightly)")
+        
+        logger.debug(f"Timestamp range: {start_ms} to {end_ms}")
         
         all_klines = []
         current_start = start_ms
@@ -137,6 +186,20 @@ class BinanceHistoricalDataFetcher:
             
         if not all_klines:
             logger.warning(f"No kline data retrieved for {symbol}")
+            
+            # Provide helpful troubleshooting
+            if interval == "1s":
+                logger.error("❌ No 1-second data available!")
+                logger.error("   Possible reasons:")
+                logger.error("   1. Date is too old (>7 days)")
+                logger.error("   2. Date is in the future")
+                logger.error("   3. Network/API issue")
+                logger.error("")
+                logger.error("   💡 Solutions:")
+                logger.error("   - Use CURRENT date/time (last 10 minutes)")
+                logger.error("   - Check your system clock")
+                logger.error("   - Try 1m interval for older dates")
+            
             return pd.DataFrame()
         
         # Convert to DataFrame
@@ -225,6 +288,78 @@ class BinanceHistoricalDataFetcher:
         
         logger.info(f"Generated {len(order_book_updates)} order book snapshots from kline data")
         return order_book_updates
+    
+    def get_kline_data_from_strings(self,
+                                    symbol: str,
+                                    start_time_str: str,
+                                    end_time_str: str,
+                                    interval: str = "1m",
+                                    time_format: str = "%Y-%m-%d %H:%M:%S") -> pd.DataFrame:
+        """
+        Convenience method to fetch kline data using string timestamps.
+        
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+            start_time_str: Start time as string (e.g., "2025-11-01 13:50:00")
+            end_time_str: End time as string (e.g., "2025-11-01 14:00:00")
+            interval: Kline interval (1s, 1m, 5m, etc.)
+            time_format: Format string for parsing timestamps
+            
+        Returns:
+            DataFrame with OHLCV data
+            
+        Example:
+            >>> fetcher = BinanceHistoricalDataFetcher()
+            >>> df = fetcher.get_kline_data_from_strings(
+            ...     "BTCUSDT",
+            ...     "2025-11-01 13:50:00",
+            ...     "2025-11-01 14:00:00",
+            ...     interval="1s"
+            ... )
+        """
+        # Parse time strings
+        start_time = datetime.strptime(start_time_str, time_format)
+        end_time = datetime.strptime(end_time_str, time_format)
+        
+        # Assume UTC if not specified
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        
+        return self.get_kline_data(symbol, start_time, end_time, interval)
+    
+    def get_recent_klines(self,
+                         symbol: str,
+                         duration_minutes: int = 10,
+                         interval: str = "1s",
+                         end_time: Optional[datetime] = None) -> pd.DataFrame:
+        """
+        Fetch recent kline data ending at current time (or specified end_time).
+        Useful for real-time testing with 1-second data.
+        
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+            duration_minutes: How many minutes of data to fetch (default: 10 minutes)
+            interval: Kline interval (1s, 1m, 5m, etc.)
+            end_time: Optional end time (defaults to now)
+            
+        Returns:
+            DataFrame with OHLCV data
+            
+        Example:
+            >>> # Get last 10 minutes of 1-second data
+            >>> fetcher = BinanceHistoricalDataFetcher()
+            >>> df = fetcher.get_recent_klines("BTCUSDT", duration_minutes=10, interval="1s")
+        """
+        if end_time is None:
+            end_time = datetime.now(timezone.utc)
+        
+        start_time = end_time - pd.Timedelta(minutes=duration_minutes)
+        
+        logger.info(f"Fetching last {duration_minutes} minutes of {symbol} data ({interval} interval)")
+        
+        return self.get_kline_data(symbol, start_time, end_time, interval)
 
 
 def test_binance_historical_fetcher():

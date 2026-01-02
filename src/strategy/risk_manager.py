@@ -109,12 +109,17 @@ class RiskManager:
     def update_position(self, 
                        position: float, 
                        avg_price: float, 
-                       timestamp: float = None) -> None:
-        """Update current position and average entry price"""
+                       timestamp: float = None,
+                       fill_price: Optional[float] = None,
+                       fee: float = 0.0) -> None:
+        """Update current position, realized PnL, and average entry price"""
         with self._lock:
             if timestamp is None:
                 timestamp = time.time()
             
+            exit_price = fill_price if fill_price is not None else avg_price
+            pnl_delta = 0.0
+
             # Calculate realized PnL if position changed
             if position != self.current_position:
                 if self.current_position != 0:
@@ -125,25 +130,36 @@ class RiskManager:
                         # Closing position
                         closed_quantity = min(abs(position_change), abs(self.current_position))
                         if self.current_position > 0:
-                            pnl_per_unit = avg_price - self.avg_entry_price
+                            pnl_per_unit = exit_price - self.avg_entry_price
                         else:
-                            pnl_per_unit = self.avg_entry_price - avg_price
-                        
+                            pnl_per_unit = self.avg_entry_price - exit_price
+
                         trade_pnl = closed_quantity * pnl_per_unit
-                        self.realized_pnl += trade_pnl
-                        self.daily_pnl += trade_pnl
-                        
-                        # Log trade
+                        pnl_delta += trade_pnl
+
+                        # Log trade with exit price context
                         self.trade_history.append({
                             'timestamp': timestamp,
                             'side': 'sell' if position_change < 0 else 'buy',
                             'quantity': closed_quantity,
-                            'price': avg_price,
+                            'price': exit_price,
                             'pnl': trade_pnl
                         })
             
             self.current_position = position
-            self.avg_entry_price = avg_price
+            self.avg_entry_price = avg_price if position != 0 else 0.0
+            
+            # Always account for fees (positive = cost, negative = rebate)
+            if fee:
+                pnl_delta -= fee
+            
+            if pnl_delta != 0.0:
+                self.realized_pnl += pnl_delta
+                self.daily_pnl += pnl_delta
+            elif fee:
+                # Pure fee impact without price PnL
+                self.realized_pnl -= fee
+                self.daily_pnl -= fee
             
             logger.debug(f"Position updated: {position:.4f} @ {avg_price:.2f}")
     

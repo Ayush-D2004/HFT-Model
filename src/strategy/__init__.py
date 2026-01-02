@@ -24,6 +24,11 @@ from .quote_manager import (
     OrderSide,
     QuoteUpdate
 )
+from .dynamic_spread import (
+    DynamicSpreadCalculator,
+    FeeConfig,
+    SpreadState
+)
 
 __all__ = [
     'AvellanedaStoikovPricer',
@@ -37,5 +42,8 @@ __all__ = [
     'Order',
     'OrderStatus',
     'OrderSide', 
-    'QuoteUpdate'
+    'QuoteUpdate',
+    'DynamicSpreadCalculator',
+    'FeeConfig',
+    'SpreadState'
 ]

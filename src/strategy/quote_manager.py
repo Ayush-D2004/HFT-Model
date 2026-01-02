@@ -384,7 +384,8 @@ class QuoteManager:
                    order_id: str, 
                    fill_price: float, 
                    fill_size: float,
-                   timestamp: float = None) -> bool:
+                   timestamp: float = None,
+                   fee: float = 0.0) -> bool:
         """
         Handle order fill notification.
         Updates order status, position tracking, and statistics.
@@ -425,7 +426,13 @@ class QuoteManager:
                     new_avg_price = 0.0
                 
                 # Update risk manager
-                self.risk_manager.update_position(new_position, new_avg_price, timestamp)
+                self.risk_manager.update_position(
+                    new_position,
+                    new_avg_price,
+                    timestamp,
+                    fill_price=fill_price,
+                    fee=fee
+                )
                 
                 # Record fill
                 fill_record = {
@@ -648,7 +655,8 @@ if __name__ == "__main__":
         quote_manager.handle_fill(
             quote_manager.current_bid_order.order_id,
             49999.0,
-            0.5
+            0.5,
+            fee=0.0
         )
     
     # Get statistics
